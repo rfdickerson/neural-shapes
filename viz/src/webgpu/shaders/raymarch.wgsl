@@ -63,6 +63,11 @@ fn intersectAabb(rayOrigin: vec3f, rayDir: vec3f, bmin: vec3f, bmax: vec3f) -> v
   return vec2f(tEnter, tExit);
 }
 
+fn hash(p: vec2f) -> f32 {
+  let h = dot(p, vec2f(127.1, 311.7));
+  return fract(sin(h) * 43758.5453123);
+}
+
 @fragment
 fn fsMain(in: VSOut) -> @location(0) vec4f {
   let camPos = camera.position.xyz;
@@ -91,27 +96,28 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
 
   var transmittance = 1.0;
   var accum = 0.0;
-  let voxelSize = 2.0 / 32.0;
-  let stepSize = voxelSize * 0.75;
+  let voxelSize = 2.0 / 64.0;
+  let maxSteps = 128u;
+  let totalDist = tEnd - tStart;
+  let stepSize = totalDist / f32(maxSteps);
   let sigma = 2.5;
-  let lightDir = normalize(vec3f(0.6, 0.7, 0.35));
-  let seed = fract(sin(dot(in.uv, vec2f(12.9898, 78.233))) * 43758.5453);
-  var t = tStart + seed * stepSize;
+  // let lightDir = normalize(vec3f(0.6, 0.7, 0.35));
+  let jitterFactor = hash(in.uv);
 
-  loop {
-    if (t > tEnd || transmittance < 0.01) {
+  for (var i = 0u; i < maxSteps; i++) {
+    if (transmittance < 0.01) {
       break;
     }
-
+    let t = tStart + (f32(i) + jitterFactor) * stepSize;
     let p = camPos + rayDir * t;
     let d = density(p);
-    let n = estimateNormal(p, voxelSize * 0.5);
-    let light = max(dot(n, lightDir), 0.0);
-    let shaded = d * (0.15 + 0.85 * light);
-    let attenuation = exp(-d * sigma * stepSize);
-    accum += transmittance * shaded * stepSize;
-    transmittance *= attenuation;
-    t += stepSize;
+    // let n = estimateNormal(p, voxelSize * 0.5);
+    // let light = max(dot(n, lightDir), 0.0);
+    // let shaded = d * (0.15 + 0.85 * light);
+    let alpha = 1.0 - exp(-d * sigma * stepSize);
+    let contrib = alpha * transmittance;
+    accum += contrib;
+    transmittance *= (1.0 - alpha);
   }
 
   let gray = clamp(accum, 0.0, 1.0);

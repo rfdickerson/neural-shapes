@@ -1,8 +1,9 @@
 import shaderSource from "./shaders/raymarch.wgsl?raw";
+import fillVolumeSource from "./shaders/fillVolume.wgsl?raw";
 import type { OrbitCamera } from "./orbitCamera";
-import { createSphereVolumeData } from "./volume";
 
 const CAMERA_UNIFORM_BYTES = 64;
+const VOLUME_SIZE = 64;
 export class WebGPURenderer {
   private constructor(
     private readonly device: GPUDevice,
@@ -36,38 +37,50 @@ export class WebGPURenderer {
     const shader = device.createShaderModule({
       code: shaderSource
     });
+    const fillVolumeShader = device.createShaderModule({
+      code: fillVolumeSource
+    });
 
     const cameraBuffer = device.createBuffer({
       size: CAMERA_UNIFORM_BYTES,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
 
-    const volumeData = createSphereVolumeData(32);
     const volumeTexture = device.createTexture({
       size: {
-        width: volumeData.size,
-        height: volumeData.size,
-        depthOrArrayLayers: volumeData.size
+        width: VOLUME_SIZE,
+        height: VOLUME_SIZE,
+        depthOrArrayLayers: VOLUME_SIZE
       },
       dimension: "3d",
-      format: "r8unorm",
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+      format: "rgba16float",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING
     });
     const volumeView = volumeTexture.createView({ dimension: "3d" });
-    device.queue.writeTexture(
-      { texture: volumeTexture },
-      volumeData.data,
-      {
-        offset: 0,
-        bytesPerRow: volumeData.bytesPerRow,
-        rowsPerImage: volumeData.rowsPerImage
-      },
-      {
-        width: volumeData.size,
-        height: volumeData.size,
-        depthOrArrayLayers: volumeData.size
+
+    const fillPipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: {
+        module: fillVolumeShader,
+        entryPoint: "csMain"
       }
-    );
+    });
+    const fillBindGroup = device.createBindGroup({
+      layout: fillPipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: volumeView
+        }
+      ]
+    });
+    const fillEncoder = device.createCommandEncoder();
+    const fillPass = fillEncoder.beginComputePass();
+    fillPass.setPipeline(fillPipeline);
+    fillPass.setBindGroup(0, fillBindGroup);
+    fillPass.dispatchWorkgroups(VOLUME_SIZE / 4, VOLUME_SIZE / 4, VOLUME_SIZE / 4);
+    fillPass.end();
+    device.queue.submit([fillEncoder.finish()]);
 
     const volumeSampler = device.createSampler({
       magFilter: "linear",
