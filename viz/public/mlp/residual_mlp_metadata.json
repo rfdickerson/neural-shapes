@@ -1,0 +1,61 @@
+{
+  "layout": "[W0][b0][W1][b1][W2][b2]",
+  "dtype": "float32",
+  "encoding": {
+    "type": "fourier",
+    "levels": 4,
+    "include_input": true,
+    "frequency_base": 2.0,
+    "input_dims": 3,
+    "encoded_dims": 27
+  },
+  "network": {
+    "layers": [
+      27,
+      64,
+      64,
+      1
+    ]
+  },
+  "offsets": {
+    "W0": 0,
+    "b0": 1728,
+    "W1": 1792,
+    "b1": 5888,
+    "W2": 5952,
+    "b2": 6016
+  },
+  "counts": {
+    "W0": 1728,
+    "b0": 64,
+    "W1": 4096,
+    "b1": 64,
+    "W2": 64,
+    "b2": 1
+  },
+  "shapes": {
+    "W0": [
+      64,
+      27
+    ],
+    "b0": [
+      64
+    ],
+    "W1": [
+      64,
+      64
+    ],
+    "b1": [
+      64
+    ],
+    "W2": [
+      1,
+      64
+    ],
+    "b2": [
+      1
+    ]
+  },
+  "total_floats": 6017,
+  "total_bytes": 24068
+}
