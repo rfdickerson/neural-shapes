@@ -6,6 +6,9 @@
     "levels": 4,
     "include_input": true,
     "frequency_base": 2.0,
+    "uses_two_pi": false,
+    "ordering": "input_xyz_then_per_level_sin_xyz_cos_xyz",
+    "axis_order": "xyz",
     "input_dims": 3,
     "encoded_dims": 27
   },
@@ -16,6 +19,21 @@
       64,
       1
     ]
+  },
+  "baseline": {
+    "type": "smooth_box",
+    "half_extents": [
+      0.6,
+      0.25,
+      0.6
+    ],
+    "sharpness": 14.0
+  },
+  "ground_truth": {
+    "type": "smooth_torus",
+    "major_radius": 0.55,
+    "minor_radius": 0.2,
+    "sharpness": 36.0
   },
   "offsets": {
     "W0": 0,

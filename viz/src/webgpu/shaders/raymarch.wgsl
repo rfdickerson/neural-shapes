@@ -36,7 +36,7 @@ fn density(p: vec3f) -> f32 {
   if (any(uvw < vec3f(0.0)) || any(uvw > vec3f(1.0))) {
     return 0.0;
   }
-  return textureSampleLevel(volumeTex, volumeSampler, uvw, 0.0).r;
+  return clamp(textureSampleLevel(volumeTex, volumeSampler, uvw, 0.0).r, 0.0, 1.0);
 }
 
 fn estimateNormal(p: vec3f, epsScalar: f32) -> vec3f {
@@ -110,7 +110,7 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
     }
     let t = tStart + (f32(i) + jitterFactor) * stepSize;
     let p = camPos + rayDir * t;
-    let d = density(p);
+    let d = clamp(density(p), 0.0, 1.0);
     // let n = estimateNormal(p, voxelSize * 0.5);
     // let light = max(dot(n, lightDir), 0.0);
     // let shaded = d * (0.15 + 0.85 * light);

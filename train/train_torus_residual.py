@@ -20,8 +20,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+BOX_HALF_EXTENTS: Tuple[float, float, float] = (0.6, 0.25, 0.6)
+BOX_SHARPNESS: float = 14.0
+TORUS_MAJOR_RADIUS: float = 0.55
+TORUS_MINOR_RADIUS: float = 0.2
+TORUS_SHARPNESS: float = 36.0
 
-def sdf_torus(points: torch.Tensor, major_radius: float = 0.55, minor_radius: float = 0.2) -> torch.Tensor:
+
+def sdf_torus(
+    points: torch.Tensor, major_radius: float = TORUS_MAJOR_RADIUS, minor_radius: float = TORUS_MINOR_RADIUS
+) -> torch.Tensor:
     x = points[..., 0]
     y = points[..., 1]
     z = points[..., 2]
@@ -30,7 +38,7 @@ def sdf_torus(points: torch.Tensor, major_radius: float = 0.55, minor_radius: fl
     return torch.sqrt(qx * qx + qy * qy + 1e-12) - minor_radius
 
 
-def sdf_box(points: torch.Tensor, half_extents: Tuple[float, float, float] = (0.6, 0.25, 0.6)) -> torch.Tensor:
+def sdf_box(points: torch.Tensor, half_extents: Tuple[float, float, float] = BOX_HALF_EXTENTS) -> torch.Tensor:
     b = torch.tensor(half_extents, device=points.device, dtype=points.dtype)
     q = torch.abs(points) - b
     outside = torch.clamp(q, min=0.0)
@@ -44,12 +52,12 @@ def density_from_sdf(sdf: torch.Tensor, sharpness: float) -> torch.Tensor:
 
 
 def torus_density(points: torch.Tensor) -> torch.Tensor:
-    return density_from_sdf(sdf_torus(points), sharpness=36.0)
+    return density_from_sdf(sdf_torus(points), sharpness=TORUS_SHARPNESS)
 
 
 def box_density(points: torch.Tensor) -> torch.Tensor:
     # Smooth procedural baseline.
-    return density_from_sdf(sdf_box(points), sharpness=14.0)
+    return density_from_sdf(sdf_box(points), sharpness=BOX_SHARPNESS)
 
 
 class FourierEncoding(nn.Module):
@@ -144,6 +152,9 @@ def export_model(
             "levels": encoding_levels,
             "include_input": True,
             "frequency_base": 2.0,
+            "uses_two_pi": False,
+            "ordering": "input_xyz_then_per_level_sin_xyz_cos_xyz",
+            "axis_order": "xyz",
             "input_dims": 3,
             "encoded_dims": 3 + 6 * encoding_levels,
         },
@@ -154,6 +165,17 @@ def export_model(
                 int(model.fc1.out_features),
                 int(model.fc2.out_features),
             ]
+        },
+        "baseline": {
+            "type": "smooth_box",
+            "half_extents": list(BOX_HALF_EXTENTS),
+            "sharpness": BOX_SHARPNESS,
+        },
+        "ground_truth": {
+            "type": "smooth_torus",
+            "major_radius": TORUS_MAJOR_RADIUS,
+            "minor_radius": TORUS_MINOR_RADIUS,
+            "sharpness": TORUS_SHARPNESS,
         },
         "offsets": offsets,
         "counts": counts,
@@ -198,6 +220,10 @@ def train(args: argparse.Namespace) -> None:
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Device: {device}")
+    print(
+        "Encoding: include_input=True, levels="
+        f"{args.fourier_levels}, order=input_xyz_then_per_level_sin_xyz_cos_xyz, freq=2**i (no 2pi)"
+    )
 
     encoder = FourierEncoding(levels=args.fourier_levels).to(device)
     model = ResidualMLP(input_dim=encoder.output_dim, hidden_sizes=(64, 64), output_dim=1).to(device)

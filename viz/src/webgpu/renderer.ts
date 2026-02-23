@@ -8,6 +8,7 @@ const SHADER_MAX_INPUT_DIM = 27;
 const SHADER_MAX_HIDDEN = 64;
 const MLP_META_URL = "/mlp/residual_mlp_metadata.json";
 const MLP_WEIGHTS_URL = "/mlp/residual_mlp_weights.bin";
+const EXPECTED_ENCODING_ORDER = "input_xyz_then_per_level_sin_xyz_cos_xyz";
 
 interface ExportMetadata {
   layout: string;
@@ -16,6 +17,10 @@ interface ExportMetadata {
     levels: number;
     include_input?: boolean;
     frequency_base?: number;
+    uses_two_pi?: boolean;
+    ordering?: string;
+    axis_order?: string;
+    input_dims?: number;
     encoded_dims: number;
   };
   network: {
@@ -115,14 +120,33 @@ async function loadExportedMlpData(): Promise<LoadedMlpData> {
   const encodedDims = Math.trunc(meta.encoding.encoded_dims);
   const includeInput = meta.encoding.include_input ?? true;
   const frequencyBase = meta.encoding.frequency_base ?? 2.0;
+  const usesTwoPi = meta.encoding.uses_two_pi ?? false;
+  const axisOrder = meta.encoding.axis_order ?? "xyz";
+  const ordering = meta.encoding.ordering ?? EXPECTED_ENCODING_ORDER;
+  const inputDims = Math.trunc(meta.encoding.input_dims ?? 3);
   if (!Number.isFinite(fourierLevels) || !Number.isFinite(encodedDims)) {
     throw new Error("MLP metadata encoding.levels / encoding.encoded_dims must be numeric.");
+  }
+  if (!Number.isFinite(inputDims)) {
+    throw new Error("MLP metadata encoding.input_dims must be numeric.");
   }
   if (!includeInput) {
     throw new Error("Renderer expects Fourier encoding metadata include_input=true.");
   }
   if (Math.abs(frequencyBase - 2.0) > 1e-6) {
     throw new Error(`Renderer expects frequency_base=2.0, got ${frequencyBase}.`);
+  }
+  if (usesTwoPi) {
+    throw new Error("Renderer expects uses_two_pi=false (training uses sin(freq*x), not sin(2*pi*freq*x)).");
+  }
+  if (axisOrder !== "xyz") {
+    throw new Error(`Renderer expects axis_order='xyz', got '${axisOrder}'.`);
+  }
+  if (ordering !== EXPECTED_ENCODING_ORDER) {
+    throw new Error(`Renderer expects encoding ordering '${EXPECTED_ENCODING_ORDER}', got '${ordering}'.`);
+  }
+  if (inputDims !== 3) {
+    throw new Error(`Renderer expects encoding.input_dims=3, got ${inputDims}.`);
   }
   if (fourierLevels < 1) {
     throw new Error(`Renderer requires fourierLevels >= 1, got ${fourierLevels}.`);

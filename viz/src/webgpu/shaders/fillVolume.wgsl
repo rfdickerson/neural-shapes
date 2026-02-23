@@ -2,6 +2,8 @@ enable f16;
 
 const ENCODED_DIM = 27u;
 const MAX_HIDDEN = 64u;
+const BOX_HALF_EXTENTS = vec3<f32>(0.6, 0.25, 0.6);
+const BOX_SHARPNESS = 14.0;
 
 struct MLPMetadata {
   inputDim: u32,
@@ -35,15 +37,18 @@ fn encodePosition(p: vec3<f32>) -> array<f32, ENCODED_DIM> {
 
   for (var i = 0u; i < mlpMeta.fourierLevels; i++) {
     let freq = pow(2.0, f32(i));
+
+    // Must match training order exactly:
+    // [sin(freq*x), sin(freq*y), sin(freq*z), cos(freq*x), cos(freq*y), cos(freq*z)]
     out[idx] = sin(freq * p.x);
-    idx++;
-    out[idx] = cos(freq * p.x);
     idx++;
     out[idx] = sin(freq * p.y);
     idx++;
-    out[idx] = cos(freq * p.y);
-    idx++;
     out[idx] = sin(freq * p.z);
+    idx++;
+    out[idx] = cos(freq * p.x);
+    idx++;
+    out[idx] = cos(freq * p.y);
     idx++;
     out[idx] = cos(freq * p.z);
     idx++;
@@ -128,8 +133,8 @@ fn sdBox(p: vec3<f32>, halfExtents: vec3<f32>) -> f32 {
 }
 
 fn smoothBoxBaseline(p: vec3<f32>) -> f32 {
-  let sdf = sdBox(p, vec3<f32>(0.6, 0.25, 0.6));
-  return 1.0 / (1.0 + exp(14.0 * sdf));
+  let sdf = sdBox(p, BOX_HALF_EXTENTS);
+  return 1.0 / (1.0 + exp(BOX_SHARPNESS * sdf));
 }
 
 @compute @workgroup_size(4, 4, 4)
@@ -143,8 +148,8 @@ fn csMain(@builtin(global_invocation_id) id: vec3<u32>) {
   let p = uvw * 2.0 - 1.0;
 
   let macroDensity = smoothBoxBaseline(p);
-  let residual = mlpResidual(p);
-  let density = clamp(max(macroDensity + residual, 0.0), 0.0, 1.0);
+  let residual = mlpResidual(p); // keep signed so negative values can carve holes
+  let density = clamp(macroDensity + residual, 0.0, 1.0);
 
   textureStore(volumeOut, vec3<i32>(id), vec4f(density, 0.0, 0.0, 0.0));
 }
