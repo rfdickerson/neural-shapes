@@ -12,9 +12,12 @@ const MLP_META_URL = "/mlp/residual_mlp_metadata.json";
 const MLP_WEIGHTS_URL = "/mlp/residual_mlp_weights.bin";
 const EXPECTED_ENCODING_ORDER = "input_xyz_then_per_level_sin_xyz_cos_xyz";
 const DEFAULT_SIGMA = 4.0;
-const DEFAULT_PHASE_G = 0.72;
-const DEFAULT_SUN_INTENSITY = 2.4;
-const DEFAULT_ALBEDO = 0.92;
+const DEFAULT_PHASE_G = 0.877;
+const DEFAULT_SUN_INTENSITY = 2.6;
+const DEFAULT_ALBEDO = 1.0;
+// Mitsuba directional emitter direction points from light toward scene.
+// Renderer uses direction toward the light source, so we negate it.
+const DEFAULT_SUN_DIRECTION: [number, number, number] = [0.5826, 0.7660, 0.2717];
 const LIGHT_MARCH_STEPS = 96;
 const MULTISCATTER_ITERS = 8;
 const MULTISCATTER_LAMBDA = 0.58;
@@ -447,7 +450,11 @@ export class WebGPURenderer {
   private reconstructionNoiseFloor = DEFAULT_RECON_NOISE_FLOOR;
   private readonly phaseG = DEFAULT_PHASE_G;
   private readonly sunIntensity = DEFAULT_SUN_INTENSITY;
-  private sunDirection = normalize3(0.5, 0.78, 0.37);
+  private sunDirection = normalize3(
+    DEFAULT_SUN_DIRECTION[0],
+    DEFAULT_SUN_DIRECTION[1],
+    DEFAULT_SUN_DIRECTION[2]
+  );
   private volumeDirty = false;
   private lightingDirty = false;
   private frameDirty = true;
@@ -616,7 +623,7 @@ export class WebGPURenderer {
 
     const lightingStepDistance = 2.0 / VOLUME_SIZE;
     const sunPassParamsData = createLightingParamsBufferData(
-      normalize3(0.5, 0.78, 0.37),
+      normalize3(DEFAULT_SUN_DIRECTION[0], DEFAULT_SUN_DIRECTION[1], DEFAULT_SUN_DIRECTION[2]),
       DEFAULT_SUN_INTENSITY,
       densityControlToSigma(DEFAULT_SIGMA),
       DEFAULT_PHASE_G,
@@ -633,7 +640,7 @@ export class WebGPURenderer {
     device.queue.writeBuffer(sunPassParamsBuffer, 0, sunPassParamsData);
 
     const multiScatterParamsData = createLightingParamsBufferData(
-      normalize3(0.5, 0.78, 0.37),
+      normalize3(DEFAULT_SUN_DIRECTION[0], DEFAULT_SUN_DIRECTION[1], DEFAULT_SUN_DIRECTION[2]),
       DEFAULT_SUN_INTENSITY,
       densityControlToSigma(DEFAULT_SIGMA),
       DEFAULT_PHASE_G,

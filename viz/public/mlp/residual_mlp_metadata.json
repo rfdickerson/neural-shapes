@@ -15,8 +15,8 @@
   "network": {
     "layers": [
       39,
-      192,
-      192,
+      128,
+      128,
       1
     ]
   },
@@ -36,6 +36,10 @@
     "meta_path": "/home/rfdic/projects/neural-clouds/train/outputs/wdas_cloud_quarter_samples_4000000.json",
     "count": 4000000,
     "guided_count": 868417,
+    "shell_count": 31614,
+    "train_count": 3600000,
+    "test_count": 400000,
+    "val_ratio": 0.1,
     "meta": {
       "format": "xyz_density_f32",
       "count": 4000000,
@@ -70,47 +74,56 @@
         "density_max": 1,
         "density_mean": 0.116921
       }
+    },
+    "training_focus": {
+      "type": "iso_surface_shell",
+      "iso_value": 0.1,
+      "iso_band": 0.05,
+      "iso_shell_ratio": 0.35,
+      "iso_loss_weight": 3.0,
+      "empty_density_threshold": 0.02,
+      "empty_space_loss_weight": 1.0
     }
   },
   "offsets": {
     "W0": 0,
-    "b0": 7488,
-    "W1": 7680,
-    "b1": 44544,
-    "W2": 44736,
-    "b2": 44928
+    "b0": 4992,
+    "W1": 5120,
+    "b1": 21504,
+    "W2": 21632,
+    "b2": 21760
   },
   "counts": {
-    "W0": 7488,
-    "b0": 192,
-    "W1": 36864,
-    "b1": 192,
-    "W2": 192,
+    "W0": 4992,
+    "b0": 128,
+    "W1": 16384,
+    "b1": 128,
+    "W2": 128,
     "b2": 1
   },
   "shapes": {
     "W0": [
-      192,
+      128,
       39
     ],
     "b0": [
-      192
+      128
     ],
     "W1": [
-      192,
-      192
+      128,
+      128
     ],
     "b1": [
-      192
+      128
     ],
     "W2": [
       1,
-      192
+      128
     ],
     "b2": [
       1
     ]
   },
-  "total_floats": 44929,
-  "total_bytes": 179716
+  "total_floats": 21761,
+  "total_bytes": 87044
 }

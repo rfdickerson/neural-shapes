@@ -40,7 +40,7 @@ fn csMain(@builtin(global_invocation_id) id: vec3u) {
 
   let sunDir = normalize(params.sunDirectionIntensity.xyz);
   let sunIntensity = max(params.sunDirectionIntensity.w, 0.01);
-  let sunNoon = vec3f(1.0, 0.99, 0.98);
+  let sunNoon = vec3f(1.0, 0.962, 0.885);
   let sunSet = vec3f(1.0, 0.35, 0.05);
   let dynamicSun = mix(sunSet, sunNoon, smoothstep(-0.05, 0.2, sunDir.y));
   let extinction = smoothstep(-0.15, 0.15, sunDir.y);

@@ -146,7 +146,9 @@ fn smoothBoxBaseline(p: vec3<f32>) -> f32 {
 
 fn evalRawDensity(p: vec3<f32>) -> f32 {
   let macroDensity = fillParams.params.w * smoothBoxBaseline(p);
-  let residual = mlpResidual(p); // keep signed so negative values can carve holes
+  // Keep signed residual unmodified so valid cap/overhang detail is preserved.
+  // Empty-space suppression is handled by training loss + reconstruction noise floor.
+  let residual = mlpResidual(p);
   return clamp(macroDensity + residual, 0.0, 1.0);
 }
 

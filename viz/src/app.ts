@@ -1,8 +1,8 @@
 import { OrbitCamera } from "./webgpu/orbitCamera";
 import { WebGPURenderer, type RenderMode } from "./webgpu/renderer";
 
-const DEFAULT_SUN_PITCH = -3;
-const DEFAULT_SUN_AZIMUTH = -180;
+const DEFAULT_SUN_PITCH = 50;
+const DEFAULT_SUN_AZIMUTH = 25;
 const DEFAULT_NOISE_FLOOR = 0.14;
 const MAX_RENDER_DPR = 1.5;
 

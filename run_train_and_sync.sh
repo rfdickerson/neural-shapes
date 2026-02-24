@@ -17,6 +17,17 @@ SAMPLE_COUNT="${SAMPLE_COUNT:-4000000}"
 SAMPLES_BIN="${SAMPLES_BIN:-$TRAIN_DIR/outputs/wdas_cloud_quarter_samples_${SAMPLE_COUNT}.bin}"
 SAMPLES_META="${SAMPLES_META:-$TRAIN_DIR/outputs/wdas_cloud_quarter_samples_${SAMPLE_COUNT}.json}"
 FORCE_REBUILD_SAMPLES="${FORCE_REBUILD_SAMPLES:-0}"
+ISO_VALUE="${ISO_VALUE:-0.10}"
+ISO_BAND="${ISO_BAND:-0.05}"
+ISO_SHELL_RATIO="${ISO_SHELL_RATIO:-0.35}"
+ISO_LOSS_WEIGHT="${ISO_LOSS_WEIGHT:-3.0}"
+EMPTY_DENSITY_THRESHOLD="${EMPTY_DENSITY_THRESHOLD:-0.02}"
+EMPTY_SPACE_LOSS_WEIGHT="${EMPTY_SPACE_LOSS_WEIGHT:-1.0}"
+HIDDEN_SIZE="${HIDDEN_SIZE:-128}"
+VAL_RATIO="${VAL_RATIO:-0.10}"
+LR_FINAL="${LR_FINAL:-1e-4}"
+LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-300}"
+LOSS_RAMP_STEPS="${LOSS_RAMP_STEPS:-3000}"
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   "$PYTHON" "$TRAIN_DIR/train_torus_residual.py" --help
@@ -42,6 +53,17 @@ fi
   --target-source samples \
   --samples-bin "$SAMPLES_BIN" \
   --samples-meta "$SAMPLES_META" \
+  --iso-value "$ISO_VALUE" \
+  --iso-band "$ISO_BAND" \
+  --iso-shell-ratio "$ISO_SHELL_RATIO" \
+  --loss-iso-weight "$ISO_LOSS_WEIGHT" \
+  --empty-density-threshold "$EMPTY_DENSITY_THRESHOLD" \
+  --loss-empty-space-weight "$EMPTY_SPACE_LOSS_WEIGHT" \
+  --hidden-layers "$HIDDEN_SIZE" "$HIDDEN_SIZE" \
+  --val-ratio "$VAL_RATIO" \
+  --lr-final "$LR_FINAL" \
+  --lr-warmup-steps "$LR_WARMUP_STEPS" \
+  --loss-ramp-steps "$LOSS_RAMP_STEPS" \
   --output-dir "$TRAIN_DIR/outputs" \
   --copy-to-viz \
   --viz-mlp-dir "$ROOT_DIR/viz/public/mlp" \

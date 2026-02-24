@@ -252,7 +252,7 @@ fn skyColor(dir: vec3f, sunDir: vec3f, sunIntensity: f32) -> vec3f {
 
   let sunDisk = pow(cosTheta, mix(420.0, 220.0, sunset));
   let sunGlow = pow(cosTheta, mix(46.0, 10.0, sunset));
-  let sunColorDay = vec3f(1.0, 0.97, 0.92);
+  let sunColorDay = vec3f(1.0, 0.962, 0.885);
   let sunColorSunset = vec3f(1.45, 0.58, 0.24);
   let sunColor = mix(sunColorDay, sunColorSunset, sunset);
   sky += sunColor * sunIntensity * (sunDisk + sunGlow * (0.05 + 0.20 * sunset));
@@ -321,9 +321,9 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
   let sunViewCos = clamp(dot(rayDir, sunDir), -1.0, 1.0);
   let sunPhase = 1.5 * henyeyGreenstein(sunViewCos, autoPhaseG);
   let forwardScatterBoost = pow(max(sunViewCos, 0.0), 4.0);
-  let sunColor = mix(vec3f(1.0, 0.97, 0.92), vec3f(1.35, 0.58, 0.25), sunset);
+  let sunColor = mix(vec3f(1.0, 0.962, 0.885), vec3f(1.35, 0.58, 0.25), sunset);
   let sunRadiance = sunColor * sunIntensity;
-  let cloudAlbedo = 0.92;
+  let cloudAlbedo = 1.0;
   let ambientSky = skyColor(vec3f(0.0, 1.0, 0.0), sunDir, sunIntensity);
   let ambientBase = mix(vec3f(0.08, 0.10, 0.14), vec3f(0.18, 0.10, 0.16), sunset);
   let ambientTerm = mix(ambientBase, ambientSky, 0.35) * cloudAlbedo;
