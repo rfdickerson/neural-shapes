@@ -95,14 +95,44 @@ fn henyeyGreenstein(cosTheta: f32, g: f32) -> f32 {
 }
 
 fn skyColor(dir: vec3f, sunDir: vec3f, sunIntensity: f32) -> vec3f {
-  let t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
-  let horizon = vec3f(0.72, 0.80, 0.95);
-  let zenith = vec3f(0.12, 0.33, 0.72);
-  let sky = mix(horizon, zenith, pow(t, 0.6));
-  let sunDisk = pow(max(dot(dir, sunDir), 0.0), 256.0);
-  let sunGlow = pow(max(dot(dir, sunDir), 0.0), 32.0) * 0.08;
-  let sunColor = vec3f(1.0, 0.95, 0.85) * sunIntensity * (sunDisk + sunGlow);
-  return sky + sunColor;
+  let viewDir = normalize(dir);
+  let t = clamp(viewDir.y * 0.5 + 0.5, 0.0, 1.0);
+  let cosTheta = max(dot(viewDir, sunDir), 0.0);
+  let sunset = 1.0 - smoothstep(0.02, 0.55, sunDir.y);
+  let daylight = smoothstep(-0.14, 0.12, sunDir.y);
+
+  let dayHorizon = vec3f(0.22, 0.37, 0.68);
+  let dayZenith = vec3f(0.02, 0.08, 0.28);
+  let sunsetHorizon = vec3f(1.10, 0.45, 0.18);
+  let sunsetZenith = vec3f(0.46, 0.15, 0.52);
+  let horizon = mix(dayHorizon, sunsetHorizon, sunset);
+  let zenith = mix(dayZenith, sunsetZenith, sunset);
+
+  var sky = mix(horizon, zenith, pow(t, 0.58));
+  let hazeColorDay = vec3f(0.55, 0.67, 0.90);
+  let hazeColorSunset = vec3f(1.15, 0.58, 0.30);
+  let hazeColor = mix(hazeColorDay, hazeColorSunset, sunset);
+  let mieG = mix(0.74, 0.90, sunset);
+  let miePhase = henyeyGreenstein(cosTheta, mieG);
+  let mieStrength = mix(0.010, 0.060, sunset);
+  sky += hazeColor * miePhase * sunIntensity * mieStrength;
+
+  let purpleBand = vec3f(0.60, 0.22, 0.64) * sunset * exp(-pow(max(viewDir.y, 0.0) * 3.2, 2.0)) * 0.28;
+  sky += purpleBand;
+
+  let sunDisk = pow(cosTheta, mix(420.0, 220.0, sunset));
+  let sunGlow = pow(cosTheta, mix(46.0, 10.0, sunset));
+  let sunColorDay = vec3f(1.0, 0.97, 0.92);
+  let sunColorSunset = vec3f(1.45, 0.58, 0.24);
+  let sunColor = mix(sunColorDay, sunColorSunset, sunset);
+  sky += sunColor * sunIntensity * (sunDisk + sunGlow * (0.05 + 0.20 * sunset));
+
+  let nightSky = vec3f(0.01, 0.02, 0.05);
+  return mix(nightSky, sky, daylight);
+}
+
+fn toneMap(color: vec3f) -> vec3f {
+  return color / (vec3f(1.0) + color);
 }
 
 @fragment
@@ -116,7 +146,7 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
   let farT = camera.params.w;
   let modeFlag = camera.renderParams.x;
   let sigma = max(camera.renderParams.y, 0.01);
-  let phaseG = clamp(camera.renderParams.z, 0.0, 0.95);
+  let basePhaseG = clamp(camera.renderParams.z, 0.0, 0.95);
   let sunDir = normalize(camera.sunDirectionIntensity.xyz);
   let sunIntensity = max(camera.sunDirectionIntensity.w, 0.01);
 
@@ -135,7 +165,7 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
   let tEnd = min(farT, hit.y);
   if (tEnd <= tStart) {
     if (modeFlag > 0.5) {
-      return vec4f(skyColor(rayDir, sunDir, sunIntensity), 1.0);
+      return vec4f(clamp(toneMap(skyColor(rayDir, sunDir, sunIntensity)), vec3f(0.0), vec3f(1.0)), 1.0);
     }
     return vec4f(0.0, 0.0, 0.0, 1.0);
   }
@@ -147,10 +177,15 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
   let totalDist = tEnd - tStart;
   let stepSize = totalDist / f32(maxSteps);
   let jitterFactor = hash(in.uv);
-  let sunPhase = henyeyGreenstein(clamp(dot(rayDir, sunDir), -1.0, 1.0), phaseG);
-  let sunRadiance = vec3f(1.0, 0.97, 0.92) * sunIntensity;
+  let sunset = 1.0 - smoothstep(0.02, 0.55, sunDir.y);
+  let autoPhaseG = clamp(mix(basePhaseG, min(basePhaseG + 0.08, 0.84), sunset), 0.0, 0.90);
+  let sunPhase = henyeyGreenstein(clamp(dot(rayDir, sunDir), -1.0, 1.0), autoPhaseG);
+  let sunColor = mix(vec3f(1.0, 0.97, 0.92), vec3f(1.35, 0.58, 0.25), sunset);
+  let sunRadiance = sunColor * sunIntensity;
+  let cloudAlbedo = 0.92;
   let ambientSky = skyColor(vec3f(0.0, 1.0, 0.0), sunDir, sunIntensity);
-  let ambientTerm = mix(vec3f(0.08, 0.10, 0.13), ambientSky, 0.35);
+  let ambientBase = mix(vec3f(0.08, 0.10, 0.14), vec3f(0.18, 0.10, 0.16), sunset);
+  let ambientTerm = mix(ambientBase, ambientSky, 0.35) * cloudAlbedo;
 
   for (var i = 0u; i < maxSteps; i++) {
     if (transmittance < 0.01) {
@@ -158,25 +193,30 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
     }
     let t = tStart + (f32(i) + jitterFactor) * stepSize;
     let p = camPos + rayDir * t;
-    let d = clamp(density(p), 0.0, 1.0);
-    let alpha = 1.0 - exp(-d * sigma * stepSize);
-    let contrib = alpha * transmittance;
+    let d = density(p);
+    if (d <= 1e-4) {
+      continue;
+    }
+    let sigmaT = d * sigma;
+    let segmentTransmittance = exp(-sigmaT * stepSize);
+    let contrib = transmittance * (1.0 - segmentTransmittance);
     if (modeFlag > 0.5) {
       let sunTr = sampleSunTransmittance(p);
-      let direct = sunRadiance * sunPhase * sunTr * 2.2;
-      let indirect = sampleMultiScatter(p) * 0.9;
+      let direct = sunRadiance * sunPhase * sunTr * cloudAlbedo;
+      let indirect = sampleMultiScatter(p) * 0.45;
       let scattering = ambientTerm + direct + indirect;
       cloudAccum += scattering * contrib;
     } else {
       accum += contrib;
     }
-    transmittance *= (1.0 - alpha);
+    transmittance *= segmentTransmittance;
   }
 
   if (modeFlag > 0.5) {
     let backgroundSky = skyColor(rayDir, sunDir, sunIntensity);
     let finalCloud = cloudAccum + backgroundSky * transmittance;
-    return vec4f(clamp(finalCloud, vec3f(0.0), vec3f(1.0)), 1.0);
+    let mapped = toneMap(finalCloud);
+    return vec4f(clamp(mapped, vec3f(0.0), vec3f(1.0)), 1.0);
   }
 
   let gray = clamp(accum, 0.0, 1.0);

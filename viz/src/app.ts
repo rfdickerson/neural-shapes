@@ -1,11 +1,18 @@
 import { OrbitCamera } from "./webgpu/orbitCamera";
 import { WebGPURenderer, type RenderMode } from "./webgpu/renderer";
 
+const DEFAULT_SUN_PITCH = 51;
+const DEFAULT_SUN_AZIMUTH = 36;
+
 export class App {
   private readonly canvas: HTMLCanvasElement;
   private readonly modeSelect: HTMLSelectElement;
   private readonly densitySlider: HTMLInputElement;
   private readonly densityValue: HTMLSpanElement;
+  private readonly sunPitchSlider: HTMLInputElement;
+  private readonly sunPitchValue: HTMLSpanElement;
+  private readonly sunAzimuthSlider: HTMLInputElement;
+  private readonly sunAzimuthValue: HTMLSpanElement;
   private renderer: WebGPURenderer | null = null;
   private readonly camera: OrbitCamera;
 
@@ -44,7 +51,55 @@ export class App {
     this.densityValue.className = "controls__value";
     this.densityValue.textContent = Number(this.densitySlider.value).toFixed(2);
 
-    controls.append(label, this.modeSelect, densityLabel, this.densitySlider, this.densityValue);
+    const pitchLabel = document.createElement("label");
+    pitchLabel.className = "controls__label";
+    pitchLabel.htmlFor = "sun-pitch-slider";
+    pitchLabel.textContent = "Sun Pitch";
+
+    this.sunPitchSlider = document.createElement("input");
+    this.sunPitchSlider.id = "sun-pitch-slider";
+    this.sunPitchSlider.className = "controls__range";
+    this.sunPitchSlider.type = "range";
+    this.sunPitchSlider.min = "-89";
+    this.sunPitchSlider.max = "89";
+    this.sunPitchSlider.step = "1";
+    this.sunPitchSlider.value = String(DEFAULT_SUN_PITCH);
+
+    this.sunPitchValue = document.createElement("span");
+    this.sunPitchValue.className = "controls__value";
+    this.sunPitchValue.textContent = `${Math.round(Number(this.sunPitchSlider.value))}deg`;
+
+    const azimuthLabel = document.createElement("label");
+    azimuthLabel.className = "controls__label";
+    azimuthLabel.htmlFor = "sun-azimuth-slider";
+    azimuthLabel.textContent = "Sun Azimuth";
+
+    this.sunAzimuthSlider = document.createElement("input");
+    this.sunAzimuthSlider.id = "sun-azimuth-slider";
+    this.sunAzimuthSlider.className = "controls__range";
+    this.sunAzimuthSlider.type = "range";
+    this.sunAzimuthSlider.min = "-180";
+    this.sunAzimuthSlider.max = "180";
+    this.sunAzimuthSlider.step = "1";
+    this.sunAzimuthSlider.value = String(DEFAULT_SUN_AZIMUTH);
+
+    this.sunAzimuthValue = document.createElement("span");
+    this.sunAzimuthValue.className = "controls__value";
+    this.sunAzimuthValue.textContent = `${Math.round(Number(this.sunAzimuthSlider.value))}deg`;
+
+    controls.append(
+      label,
+      this.modeSelect,
+      densityLabel,
+      this.densitySlider,
+      this.densityValue,
+      pitchLabel,
+      this.sunPitchSlider,
+      this.sunPitchValue,
+      azimuthLabel,
+      this.sunAzimuthSlider,
+      this.sunAzimuthValue
+    );
     container.appendChild(controls);
 
     this.canvas = document.createElement("canvas");
@@ -62,12 +117,25 @@ export class App {
       this.densityValue.textContent = value.toFixed(2);
       this.renderer?.setCloudDensity(value);
     });
+
+    this.sunPitchSlider.addEventListener("input", () => {
+      const pitch = Number(this.sunPitchSlider.value);
+      this.sunPitchValue.textContent = `${Math.round(pitch)}deg`;
+      this.renderer?.setSunAngles(pitch, Number(this.sunAzimuthSlider.value));
+    });
+
+    this.sunAzimuthSlider.addEventListener("input", () => {
+      const azimuth = Number(this.sunAzimuthSlider.value);
+      this.sunAzimuthValue.textContent = `${Math.round(azimuth)}deg`;
+      this.renderer?.setSunAngles(Number(this.sunPitchSlider.value), azimuth);
+    });
   }
 
   async start(): Promise<void> {
     this.renderer = await WebGPURenderer.create(this.canvas);
     this.renderer.setRenderMode(this.modeSelect.value as RenderMode);
     this.renderer.setCloudDensity(Number(this.densitySlider.value));
+    this.renderer.setSunAngles(Number(this.sunPitchSlider.value), Number(this.sunAzimuthSlider.value));
     window.addEventListener("resize", this.handleResize);
     this.handleResize();
     requestAnimationFrame(this.frame);

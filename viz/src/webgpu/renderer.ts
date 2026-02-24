@@ -275,7 +275,8 @@ export class WebGPURenderer {
   private sigma = DEFAULT_SIGMA;
   private readonly phaseG = DEFAULT_PHASE_G;
   private readonly sunIntensity = DEFAULT_SUN_INTENSITY;
-  private readonly sunDirection = normalize3(0.5, 0.78, 0.37);
+  private sunDirection = normalize3(0.5, 0.78, 0.37);
+  private lightingDirty = false;
 
   private constructor(
     private readonly device: GPUDevice,
@@ -283,7 +284,16 @@ export class WebGPURenderer {
     private readonly format: GPUTextureFormat,
     private readonly pipeline: GPURenderPipeline,
     private readonly bindGroup: GPUBindGroup,
-    private readonly cameraBuffer: GPUBuffer
+    private readonly cameraBuffer: GPUBuffer,
+    private readonly sunTransmittancePipeline: GPUComputePipeline,
+    private readonly sunTransmittanceBindGroup: GPUBindGroup,
+    private readonly multiScatterPipeline: GPUComputePipeline,
+    private readonly multiScatterBindGroupA: GPUBindGroup,
+    private readonly multiScatterBindGroupB: GPUBindGroup,
+    private readonly sunPassParamsBuffer: GPUBuffer,
+    private readonly sunPassParamsData: Float32Array<ArrayBuffer>,
+    private readonly multiScatterParamsBuffer: GPUBuffer,
+    private readonly multiScatterParamsData: Float32Array<ArrayBuffer>
   ) {}
 
   static async create(canvas: HTMLCanvasElement): Promise<WebGPURenderer> {
@@ -675,7 +685,23 @@ export class WebGPURenderer {
       }
     });
 
-    return new WebGPURenderer(device, context, format, pipeline, bindGroup, cameraBuffer);
+    return new WebGPURenderer(
+      device,
+      context,
+      format,
+      pipeline,
+      bindGroup,
+      cameraBuffer,
+      sunTransmittancePipeline,
+      sunTransmittanceBindGroup,
+      multiScatterPipeline,
+      multiScatterBindGroupA,
+      multiScatterBindGroupB,
+      sunPassParamsBuffer,
+      sunPassParamsData,
+      multiScatterParamsBuffer,
+      multiScatterParamsData
+    );
   }
 
   setRenderMode(mode: RenderMode): void {
@@ -687,9 +713,77 @@ export class WebGPURenderer {
       return;
     }
     this.sigma = Math.max(0.01, Math.min(value, 12.0));
+    this.lightingDirty = true;
+  }
+
+  setSunAngles(pitchDegrees: number, azimuthDegrees: number): void {
+    if (!Number.isFinite(pitchDegrees) || !Number.isFinite(azimuthDegrees)) {
+      return;
+    }
+    const pitch = Math.max(-89.0, Math.min(89.0, pitchDegrees)) * (Math.PI / 180.0);
+    const azimuth = azimuthDegrees * (Math.PI / 180.0);
+    const cosPitch = Math.cos(pitch);
+    this.sunDirection = normalize3(
+      cosPitch * Math.cos(azimuth),
+      Math.sin(pitch),
+      cosPitch * Math.sin(azimuth)
+    );
+    this.lightingDirty = true;
+  }
+
+  private updateLightingPrecompute(): void {
+    this.sunPassParamsData[0] = this.sunDirection[0];
+    this.sunPassParamsData[1] = this.sunDirection[1];
+    this.sunPassParamsData[2] = this.sunDirection[2];
+    this.sunPassParamsData[3] = this.sunIntensity;
+    this.sunPassParamsData[7] = this.sigma;
+    this.sunPassParamsData[11] = LIGHT_MARCH_STEPS;
+    this.device.queue.writeBuffer(this.sunPassParamsBuffer, 0, this.sunPassParamsData);
+
+    this.multiScatterParamsData[0] = this.sunDirection[0];
+    this.multiScatterParamsData[1] = this.sunDirection[1];
+    this.multiScatterParamsData[2] = this.sunDirection[2];
+    this.multiScatterParamsData[3] = this.sunIntensity;
+    this.multiScatterParamsData[7] = this.sigma;
+    this.multiScatterParamsData[11] = 0;
+    this.device.queue.writeBuffer(this.multiScatterParamsBuffer, 0, this.multiScatterParamsData);
+
+    const precomputeEncoder = this.device.createCommandEncoder();
+
+    const sunPass = precomputeEncoder.beginComputePass();
+    sunPass.setPipeline(this.sunTransmittancePipeline);
+    sunPass.setBindGroup(0, this.sunTransmittanceBindGroup);
+    sunPass.dispatchWorkgroups(VOLUME_SIZE / 4, VOLUME_SIZE / 4, VOLUME_SIZE / 4);
+    sunPass.end();
+
+    const msSeedPass = precomputeEncoder.beginComputePass();
+    msSeedPass.setPipeline(this.multiScatterPipeline);
+    msSeedPass.setBindGroup(0, this.multiScatterBindGroupA);
+    msSeedPass.dispatchWorkgroups(VOLUME_SIZE / 4, VOLUME_SIZE / 4, VOLUME_SIZE / 4);
+    msSeedPass.end();
+
+    this.device.queue.submit([precomputeEncoder.finish()]);
+
+    for (let i = 1; i < MULTISCATTER_ITERS; i++) {
+      this.multiScatterParamsData[11] = i;
+      this.device.queue.writeBuffer(this.multiScatterParamsBuffer, 0, this.multiScatterParamsData);
+      const iterEncoder = this.device.createCommandEncoder();
+      const iterPass = iterEncoder.beginComputePass();
+      iterPass.setPipeline(this.multiScatterPipeline);
+      iterPass.setBindGroup(0, (i & 1) === 0 ? this.multiScatterBindGroupA : this.multiScatterBindGroupB);
+      iterPass.dispatchWorkgroups(VOLUME_SIZE / 4, VOLUME_SIZE / 4, VOLUME_SIZE / 4);
+      iterPass.end();
+      this.device.queue.submit([iterEncoder.finish()]);
+    }
+
+    this.lightingDirty = false;
   }
 
   render(camera: OrbitCamera): void {
+    if (this.lightingDirty) {
+      this.updateLightingPrecompute();
+    }
+
     const pos = camera.getPosition();
     const target = camera.getTarget();
     const up = camera.getUp();

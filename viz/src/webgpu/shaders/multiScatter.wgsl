@@ -26,7 +26,7 @@ fn csMain(@builtin(global_invocation_id) id: vec3u) {
   }
 
   let uvw = (vec3f(id) + vec3f(0.5)) / vec3f(dim);
-  let rawDensity = clamp(textureSampleLevel(densityVolume, volumeSampler, uvw, 0.0).r, 0.0, 1.0);
+  let density = clamp(textureSampleLevel(densityVolume, volumeSampler, uvw, 0.0).r, 0.0, 1.0);
   let sunTr = clamp(textureSampleLevel(sunTransmittanceVolume, volumeSampler, uvw, 0.0).r, 0.0, 1.0);
 
   let densityScale = max(params.mediumParams.x, 0.01);
@@ -44,7 +44,7 @@ fn csMain(@builtin(global_invocation_id) id: vec3u) {
   let extinction = smoothstep(-0.15, 0.15, sunDir.y);
   let sunRadiance = dynamicSun * sunIntensity * extinction;
 
-  let sigmaT = rawDensity * densityScale * extinctionCoeff;
+  let sigmaT = density * densityScale * extinctionCoeff;
   let source = sigmaT * sunTr * sunRadiance * (1.0 / (4.0 * kPi));
 
   let d = vec3i(dim);

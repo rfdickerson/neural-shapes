@@ -4,6 +4,7 @@ const ENCODED_DIM = 27u;
 const MAX_HIDDEN = 64u;
 const BOX_HALF_EXTENTS = vec3<f32>(0.6, 0.25, 0.6);
 const BOX_SHARPNESS = 14.0;
+const DENSITY_WRITE_CUTOFF = 0.14;
 
 struct MLPMetadata {
   inputDim: u32,
@@ -149,7 +150,8 @@ fn csMain(@builtin(global_invocation_id) id: vec3<u32>) {
 
   let macroDensity = smoothBoxBaseline(p);
   let residual = mlpResidual(p); // keep signed so negative values can carve holes
-  let density = clamp(macroDensity + residual, 0.0, 1.0);
+  let rawDensity = clamp(macroDensity + residual, 0.0, 1.0);
+  let density = select(0.0, rawDensity, rawDensity >= DENSITY_WRITE_CUTOFF);
 
   textureStore(volumeOut, vec3<i32>(id), vec4f(density, 0.0, 0.0, 0.0));
 }
