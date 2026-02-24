@@ -13,10 +13,10 @@ else
 fi
 
 VDB_PATH="${VDB_PATH:-$TRAIN_DIR/wdas_cloud_quarter.vdb}"
-VOLUME_DIM="${VOLUME_DIM:-256}"
-VOLUME_BIN="${VOLUME_BIN:-$TRAIN_DIR/outputs/wdas_cloud_quarter_${VOLUME_DIM}.bin}"
-VOLUME_META="${VOLUME_META:-$TRAIN_DIR/outputs/wdas_cloud_quarter_${VOLUME_DIM}.json}"
-FORCE_REBUILD_VOLUME="${FORCE_REBUILD_VOLUME:-0}"
+SAMPLE_COUNT="${SAMPLE_COUNT:-4000000}"
+SAMPLES_BIN="${SAMPLES_BIN:-$TRAIN_DIR/outputs/wdas_cloud_quarter_samples_${SAMPLE_COUNT}.bin}"
+SAMPLES_META="${SAMPLES_META:-$TRAIN_DIR/outputs/wdas_cloud_quarter_samples_${SAMPLE_COUNT}.json}"
+FORCE_REBUILD_SAMPLES="${FORCE_REBUILD_SAMPLES:-0}"
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   "$PYTHON" "$TRAIN_DIR/train_torus_residual.py" --help
@@ -28,20 +28,20 @@ if [[ ! -f "$VDB_PATH" ]]; then
   exit 1
 fi
 
-mkdir -p "$(dirname "$VOLUME_BIN")"
+mkdir -p "$(dirname "$SAMPLES_BIN")"
 
-if [[ "$FORCE_REBUILD_VOLUME" == "1" || ! -f "$VOLUME_BIN" || ! -f "$VOLUME_META" ]]; then
-  "$TRAIN_DIR/convert_vdb_to_dense.sh" \
+if [[ "$FORCE_REBUILD_SAMPLES" == "1" || ! -f "$SAMPLES_BIN" || ! -f "$SAMPLES_META" ]]; then
+  "$TRAIN_DIR/sample_vdb_points.sh" \
     --input "$VDB_PATH" \
-    --output-bin "$VOLUME_BIN" \
-    --output-json "$VOLUME_META" \
-    --dim "$VOLUME_DIM"
+    --output-bin "$SAMPLES_BIN" \
+    --output-json "$SAMPLES_META" \
+    --samples "$SAMPLE_COUNT"
 fi
 
 "$PYTHON" "$TRAIN_DIR/train_torus_residual.py" \
-  --target-source volume \
-  --volume-bin "$VOLUME_BIN" \
-  --volume-meta "$VOLUME_META" \
+  --target-source samples \
+  --samples-bin "$SAMPLES_BIN" \
+  --samples-meta "$SAMPLES_META" \
   --output-dir "$TRAIN_DIR/outputs" \
   --copy-to-viz \
   --viz-mlp-dir "$ROOT_DIR/viz/public/mlp" \

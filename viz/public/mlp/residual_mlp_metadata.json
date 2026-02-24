@@ -31,21 +31,15 @@
     "scale": 0.8
   },
   "ground_truth": {
-    "type": "dense_volume",
-    "bin_path": "/home/rfdic/projects/neural-clouds/train/outputs/wdas_cloud_quarter_256.bin",
-    "meta_path": "/home/rfdic/projects/neural-clouds/train/outputs/wdas_cloud_quarter_256.json",
-    "dims": [
-      256,
-      256,
-      256
-    ],
+    "type": "sparse_samples",
+    "bin_path": "/home/rfdic/projects/neural-clouds/train/outputs/wdas_cloud_quarter_samples_4000000.bin",
+    "meta_path": "/home/rfdic/projects/neural-clouds/train/outputs/wdas_cloud_quarter_samples_4000000.json",
+    "count": 4000000,
+    "guided_count": 868417,
     "meta": {
-      "format": "dense_f32",
-      "dims": [
-        256,
-        256,
-        256
-      ],
+      "format": "xyz_density_f32",
+      "count": 4000000,
+      "stride_floats": 4,
       "domain": "normalized_cube",
       "domain_min": [
         -1.0,
@@ -58,7 +52,7 @@
         1.0
       ],
       "source": {
-        "vdb_path": "./train/wdas_cloud_quarter.vdb",
+        "vdb_path": "/home/rfdic/projects/neural-clouds/train/wdas_cloud_quarter.vdb",
         "grid": "density",
         "active_world_min": [
           -217.499995,
@@ -70,6 +64,11 @@
           214.166662,
           212.499995
         ]
+      },
+      "stats": {
+        "density_min": 0,
+        "density_max": 1,
+        "density_mean": 0.116921
       }
     }
   },

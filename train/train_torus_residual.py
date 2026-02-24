@@ -5,6 +5,7 @@ Train a residual MLP to approximate a density field relative to a box baseline.
 Targets supported:
   - torus (analytic smooth torus)
   - volume (dense preconverted volume sampled in normalized [-1,1]^3)
+  - samples (sparse xyz+density samples generated directly from VDB)
 
 This script exports:
   - FP32 flat weight blob in layout [W0][b0][W1][b1][W2][b2]
@@ -14,6 +15,7 @@ This script exports:
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import shutil
 import struct
@@ -29,6 +31,13 @@ BOX_SHARPNESS: float = 14.0
 TORUS_MAJOR_RADIUS: float = 0.55
 TORUS_MINOR_RADIUS: float = 0.2
 TORUS_SHARPNESS: float = 36.0
+
+
+@dataclass
+class SparseSampleBank:
+    points: torch.Tensor  # [N,3] in normalized [-1,1]^3
+    density: torch.Tensor  # [N] in [0,1]
+    guided_indices: torch.Tensor  # [M] indices with density > importance threshold
 
 
 def sdf_torus(
@@ -98,6 +107,44 @@ def load_dense_volume(
     volume = flat.view(depth, height, width).to(device=device, dtype=torch.float32)
     volume = volume.clamp(0.0, 1.0)
     return volume, meta
+
+
+def load_sparse_samples(
+    samples_bin_path: Path,
+    samples_meta_path: Path | None,
+    importance_threshold: float,
+) -> Tuple[SparseSampleBank, Dict[str, Any]]:
+    meta_path = samples_meta_path if samples_meta_path is not None else samples_bin_path.with_suffix(".json")
+    if not samples_bin_path.exists():
+        raise FileNotFoundError(f"missing sparse samples binary: {samples_bin_path}")
+    if not meta_path.exists():
+        raise FileNotFoundError(f"missing sparse samples metadata: {meta_path}")
+
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    raw = samples_bin_path.read_bytes()
+    if len(raw) % 16 != 0:
+        raise ValueError(
+            f"sparse samples byte size must be divisible by 16 (xyz+density float32), got {len(raw)}"
+        )
+
+    count = len(raw) // 16
+    meta_count = meta.get("count")
+    if meta_count is not None:
+        try:
+            meta_count_int = int(meta_count)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"invalid count in sparse samples metadata: {meta_count}") from exc
+        if meta_count_int != count:
+            raise ValueError(
+                f"sparse samples count mismatch: metadata count={meta_count_int}, binary count={count}"
+            )
+
+    flat = torch.frombuffer(bytearray(raw), dtype=torch.float32).clone().view(count, 4)
+    points = flat[:, 0:3].contiguous().clamp(-1.0, 1.0)
+    density = flat[:, 3].contiguous().clamp(0.0, 1.0)
+    guided_indices = torch.nonzero(density > max(0.0, float(importance_threshold)), as_tuple=False).squeeze(1)
+    bank = SparseSampleBank(points=points, density=density, guided_indices=guided_indices.to(torch.long))
+    return bank, meta
 
 
 def sample_volume_trilinear(volume: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
@@ -195,6 +242,7 @@ def sample_batch(
     device: torch.device,
     target_source: str,
     target_volume: torch.Tensor | None,
+    target_sample_bank: SparseSampleBank | None,
     baseline_scale: float,
     importance_ratio: float,
     importance_threshold: float,
@@ -250,6 +298,46 @@ def sample_batch(
         perm = torch.randperm(batch_size, device=device)
         points = points[perm]
         gt = sample_volume_trilinear(target_volume, points)
+    elif target_source == "samples":
+        if target_sample_bank is None:
+            raise ValueError("target_sample_bank must be provided when target_source='samples'")
+
+        bank = target_sample_bank
+        sample_count = int(bank.points.shape[0])
+        if sample_count <= 0:
+            raise ValueError("sparse samples bank is empty")
+
+        guided_ratio = float(max(0.0, min(1.0, importance_ratio)))
+        guided_count = int(batch_size * guided_ratio)
+        uniform_count = batch_size - guided_count
+
+        point_chunks: List[torch.Tensor] = []
+        gt_chunks: List[torch.Tensor] = []
+
+        if uniform_count > 0:
+            idx_uniform = torch.randint(0, sample_count, (uniform_count,), dtype=torch.long)
+            point_chunks.append(bank.points.index_select(0, idx_uniform).to(device=device))
+            gt_chunks.append(bank.density.index_select(0, idx_uniform).to(device=device))
+
+        if guided_count > 0:
+            guided_pool = bank.guided_indices
+            if guided_pool.numel() > 0:
+                pick = torch.randint(0, int(guided_pool.shape[0]), (guided_count,), dtype=torch.long)
+                idx_guided = guided_pool.index_select(0, pick)
+            else:
+                idx_guided = torch.randint(0, sample_count, (guided_count,), dtype=torch.long)
+            point_chunks.append(bank.points.index_select(0, idx_guided).to(device=device))
+            gt_chunks.append(bank.density.index_select(0, idx_guided).to(device=device))
+
+        points = torch.cat(point_chunks, dim=0)
+        gt = torch.cat(gt_chunks, dim=0)
+        if points.shape[0] != batch_size:
+            raise RuntimeError(f"sampled unexpected point count {points.shape[0]}, expected {batch_size}")
+
+        # Keep stochastic ordering to avoid chunk-order bias between uniform and guided subsets.
+        perm = torch.randperm(batch_size, device=device)
+        points = points[perm]
+        gt = gt[perm]
     else:
         raise ValueError(f"unsupported target_source '{target_source}'")
     baseline = baseline_scale * box_density(points)
@@ -421,6 +509,7 @@ def train(args: argparse.Namespace) -> None:
 
     target_source = str(args.target_source).strip().lower()
     target_volume: torch.Tensor | None = None
+    target_sample_bank: SparseSampleBank | None = None
     ground_truth_info: Dict[str, Any]
     if target_source == "torus":
         ground_truth_info = {
@@ -450,8 +539,36 @@ def train(args: argparse.Namespace) -> None:
             "dims": list(target_volume.shape),
             "meta": volume_meta,
         }
+    elif target_source == "samples":
+        if not args.samples_bin:
+            raise ValueError("--samples-bin is required when --target-source=samples")
+        samples_bin_path = Path(args.samples_bin)
+        samples_meta_path = Path(args.samples_meta) if args.samples_meta else None
+        target_sample_bank, samples_meta = load_sparse_samples(
+            samples_bin_path=samples_bin_path,
+            samples_meta_path=samples_meta_path,
+            importance_threshold=args.importance_threshold,
+        )
+        sample_min = float(target_sample_bank.density.min().item())
+        sample_max = float(target_sample_bank.density.max().item())
+        sample_mean = float(target_sample_bank.density.mean().item())
+        sample_count = int(target_sample_bank.points.shape[0])
+        guided_count = int(target_sample_bank.guided_indices.shape[0])
+        print(
+            f"Target source: samples ({samples_bin_path}), "
+            f"count={sample_count}, guided_count={guided_count}, "
+            f"min={sample_min:.6f}, max={sample_max:.6f}, mean={sample_mean:.6f}"
+        )
+        ground_truth_info = {
+            "type": "sparse_samples",
+            "bin_path": str(samples_bin_path),
+            "meta_path": str(samples_meta_path if samples_meta_path is not None else samples_bin_path.with_suffix('.json')),
+            "count": sample_count,
+            "guided_count": guided_count,
+            "meta": samples_meta,
+        }
     else:
-        raise ValueError(f"--target-source must be one of ['torus', 'volume'], got '{args.target_source}'")
+        raise ValueError(f"--target-source must be one of ['torus', 'volume', 'samples'], got '{args.target_source}'")
 
     encoder = FourierEncoding(levels=args.fourier_levels).to(device)
     model = ResidualMLP(input_dim=encoder.output_dim, hidden_sizes=(hidden0, hidden1), output_dim=1).to(device)
@@ -466,6 +583,7 @@ def train(args: argparse.Namespace) -> None:
             device=device,
             target_source=target_source,
             target_volume=target_volume,
+            target_sample_bank=target_sample_bank,
             baseline_scale=args.baseline_scale,
             importance_ratio=args.importance_ratio,
             importance_threshold=args.importance_threshold,
@@ -517,6 +635,7 @@ def train(args: argparse.Namespace) -> None:
             device=device,
             target_source=target_source,
             target_volume=target_volume,
+            target_sample_bank=target_sample_bank,
             baseline_scale=args.baseline_scale,
             importance_ratio=args.importance_ratio,
             importance_threshold=args.importance_threshold,
@@ -560,7 +679,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     repo_root = train_dir.parent
     default_viz_dir = repo_root / "viz" / "public" / "mlp"
     default_volume_bin = train_dir / "outputs" / "wdas_cloud_quarter_256.bin"
-    p = argparse.ArgumentParser(description="Train residual MLP vs box baseline (torus or dense volume) and export flat weights.")
+    default_samples_bin = train_dir / "outputs" / "wdas_cloud_quarter_samples_4000000.bin"
+    p = argparse.ArgumentParser(
+        description="Train residual MLP vs box baseline (torus, dense volume, or sparse VDB samples) and export flat weights."
+    )
     p.add_argument("--output-dir", type=str, default="outputs")
     p.add_argument("--weights-name", type=str, default="residual_mlp_weights.bin")
     p.add_argument("--meta-name", type=str, default="residual_mlp_metadata.json")
@@ -617,9 +739,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--target-source",
         type=str,
-        default="volume",
-        choices=["torus", "volume"],
-        help="Ground-truth source. Defaults to 'volume' using the quarter-resolution Disney cloud export.",
+        default="samples",
+        choices=["torus", "volume", "samples"],
+        help="Ground-truth source. Defaults to sparse samples generated directly from the quarter-resolution Disney VDB.",
     )
     p.add_argument(
         "--volume-bin",
@@ -632,6 +754,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default="",
         help="Optional path to JSON metadata with dims. Defaults to <volume-bin>.json.",
+    )
+    p.add_argument(
+        "--samples-bin",
+        type=str,
+        default=str(default_samples_bin),
+        help="Path to sparse xyz+density samples binary used when --target-source=samples.",
+    )
+    p.add_argument(
+        "--samples-meta",
+        type=str,
+        default="",
+        help="Optional path to sparse samples metadata JSON. Defaults to <samples-bin>.json.",
     )
     p.add_argument("--log-every", type=int, default=200)
     p.add_argument(

@@ -23,8 +23,10 @@ const RECON_NOISE_KNEE = 0.03;
 const DEFAULT_BASELINE_HALF_EXTENTS: [number, number, number] = [0.6, 0.25, 0.6];
 const DEFAULT_BASELINE_SHARPNESS = 14.0;
 const DEFAULT_BASELINE_SCALE = 1.0;
+const BLUE_NOISE_SIZE = 64;
 
 export type RenderMode = "cloudSky" | "fogOnly";
+export type DensitySource = "neural" | "texture";
 
 interface ExportMetadata {
   layout: string;
@@ -289,6 +291,104 @@ function normalize3(x: number, y: number, z: number): [number, number, number] {
   return [x / len, y / len, z / len];
 }
 
+function lcgNext(state: number): number {
+  return (state * 1664525 + 1013904223) >>> 0;
+}
+
+function generateBlueNoiseRank(size: number, seed: number): Uint8Array<ArrayBuffer> {
+  const total = size * size;
+  const xs = new Uint16Array<ArrayBuffer>(new ArrayBuffer(total * 2));
+  const ys = new Uint16Array<ArrayBuffer>(new ArrayBuffer(total * 2));
+  for (let i = 0; i < total; i++) {
+    xs[i] = i % size;
+    ys[i] = Math.floor(i / size);
+  }
+
+  const selected = new Uint8Array<ArrayBuffer>(new ArrayBuffer(total));
+  const minDist2 = new Float32Array<ArrayBuffer>(new ArrayBuffer(total * 4));
+  minDist2.fill(Number.POSITIVE_INFINITY);
+  const ranks = new Uint16Array<ArrayBuffer>(new ArrayBuffer(total * 2));
+
+  let state = seed >>> 0;
+  if (state === 0) {
+    state = 1;
+  }
+  let chosen = state % total;
+
+  for (let rank = 0; rank < total; rank++) {
+    selected[chosen] = 1;
+    ranks[chosen] = rank;
+
+    const cx = xs[chosen];
+    const cy = ys[chosen];
+    for (let j = 0; j < total; j++) {
+      if (selected[j] !== 0) {
+        continue;
+      }
+      let dx = xs[j] > cx ? xs[j] - cx : cx - xs[j];
+      let dy = ys[j] > cy ? ys[j] - cy : cy - ys[j];
+      if (dx > size - dx) {
+        dx = size - dx;
+      }
+      if (dy > size - dy) {
+        dy = size - dy;
+      }
+      const d2 = dx * dx + dy * dy;
+      if (d2 < minDist2[j]) {
+        minDist2[j] = d2;
+      }
+    }
+
+    if (rank === total - 1) {
+      break;
+    }
+
+    state = lcgNext(state);
+    const scanOffset = state % total;
+    let bestIndex = -1;
+    let bestScore = -1;
+    for (let s = 0; s < total; s++) {
+      const j = (scanOffset + s) % total;
+      if (selected[j] !== 0) {
+        continue;
+      }
+      const score = minDist2[j];
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = j;
+      }
+    }
+    chosen = bestIndex >= 0 ? bestIndex : chosen;
+  }
+
+  const out = new Uint8Array<ArrayBuffer>(new ArrayBuffer(total));
+  const scale = 255 / Math.max(total - 1, 1);
+  for (let i = 0; i < total; i++) {
+    out[i] = Math.round(ranks[i] * scale);
+  }
+  return out;
+}
+
+function createBlueNoiseTextureData(size: number): Uint8Array<ArrayBuffer> {
+  const base = generateBlueNoiseRank(size, 0x9e3779b9);
+  const out = new Uint8Array<ArrayBuffer>(new ArrayBuffer(size * size * 4));
+  const shiftX = Math.max(1, Math.floor(size * 0.37));
+  const shiftY = Math.max(1, Math.floor(size * 0.61));
+
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const idx = y * size + x;
+      const shiftedIdx = ((y + shiftY) % size) * size + ((x + shiftX) % size);
+      const outIdx = idx * 4;
+      out[outIdx] = base[idx];
+      out[outIdx + 1] = base[shiftedIdx];
+      out[outIdx + 2] = 0;
+      out[outIdx + 3] = 255;
+    }
+  }
+  return out;
+}
+
 function createLightingParamsBufferData(
   sunDirection: [number, number, number],
   sunIntensity: number,
@@ -342,6 +442,7 @@ function createReconstructionParamsBufferData(
 
 export class WebGPURenderer {
   private renderMode: RenderMode = "cloudSky";
+  private densitySource: DensitySource = "neural";
   private sigma = densityControlToSigma(DEFAULT_SIGMA);
   private reconstructionNoiseFloor = DEFAULT_RECON_NOISE_FLOOR;
   private readonly phaseG = DEFAULT_PHASE_G;
@@ -349,6 +450,7 @@ export class WebGPURenderer {
   private sunDirection = normalize3(0.5, 0.78, 0.37);
   private volumeDirty = false;
   private lightingDirty = false;
+  private frameDirty = true;
 
   private constructor(
     private readonly device: GPUDevice,
@@ -485,6 +587,32 @@ export class WebGPURenderer {
       addressModeV: "clamp-to-edge",
       addressModeW: "clamp-to-edge"
     });
+
+    const blueNoiseTextureData = createBlueNoiseTextureData(BLUE_NOISE_SIZE);
+    const blueNoiseTexture = device.createTexture({
+      size: {
+        width: BLUE_NOISE_SIZE,
+        height: BLUE_NOISE_SIZE,
+        depthOrArrayLayers: 1
+      },
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+    });
+    device.queue.writeTexture(
+      { texture: blueNoiseTexture },
+      blueNoiseTextureData,
+      {
+        offset: 0,
+        bytesPerRow: BLUE_NOISE_SIZE * 4,
+        rowsPerImage: BLUE_NOISE_SIZE
+      },
+      {
+        width: BLUE_NOISE_SIZE,
+        height: BLUE_NOISE_SIZE,
+        depthOrArrayLayers: 1
+      }
+    );
+    const blueNoiseView = blueNoiseTexture.createView();
 
     const lightingStepDistance = 2.0 / VOLUME_SIZE;
     const sunPassParamsData = createLightingParamsBufferData(
@@ -726,6 +854,29 @@ export class WebGPURenderer {
             sampleType: "float",
             viewDimension: "3d"
           }
+        },
+        {
+          binding: 5,
+          visibility: GPUShaderStage.FRAGMENT,
+          buffer: { type: "read-only-storage" }
+        },
+        {
+          binding: 6,
+          visibility: GPUShaderStage.FRAGMENT,
+          buffer: { type: "uniform" }
+        },
+        {
+          binding: 7,
+          visibility: GPUShaderStage.FRAGMENT,
+          buffer: { type: "uniform" }
+        },
+        {
+          binding: 8,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: {
+            sampleType: "float",
+            viewDimension: "2d"
+          }
         }
       ]
     });
@@ -752,6 +903,22 @@ export class WebGPURenderer {
         {
           binding: 4,
           resource: finalMultiScatterView
+        },
+        {
+          binding: 5,
+          resource: { buffer: mlpWeightsBuffer }
+        },
+        {
+          binding: 6,
+          resource: { buffer: mlpMetaBuffer }
+        },
+        {
+          binding: 7,
+          resource: { buffer: reconstructionParamsBuffer }
+        },
+        {
+          binding: 8,
+          resource: blueNoiseView
         }
       ]
     });
@@ -797,6 +964,12 @@ export class WebGPURenderer {
 
   setRenderMode(mode: RenderMode): void {
     this.renderMode = mode;
+    this.frameDirty = true;
+  }
+
+  setDensitySource(source: DensitySource): void {
+    this.densitySource = source;
+    this.frameDirty = true;
   }
 
   setCloudDensity(value: number): void {
@@ -805,6 +978,7 @@ export class WebGPURenderer {
     }
     this.sigma = densityControlToSigma(value);
     this.lightingDirty = true;
+    this.frameDirty = true;
   }
 
   setReconstructionNoiseFloor(value: number): void {
@@ -819,6 +993,7 @@ export class WebGPURenderer {
     this.reconstructionParamsData[5] = next;
     this.device.queue.writeBuffer(this.reconstructionParamsBuffer, 0, this.reconstructionParamsData);
     this.volumeDirty = true;
+    this.frameDirty = true;
   }
 
   setSunAngles(pitchDegrees: number, azimuthDegrees: number): void {
@@ -834,6 +1009,11 @@ export class WebGPURenderer {
       cosPitch * Math.sin(azimuth)
     );
     this.lightingDirty = true;
+    this.frameDirty = true;
+  }
+
+  hasPendingRenderWork(): boolean {
+    return this.frameDirty || this.volumeDirty || this.lightingDirty;
   }
 
   private updateVolumePrecompute(): void {
@@ -909,6 +1089,7 @@ export class WebGPURenderer {
     const up = camera.getUp();
     const [near, far] = camera.getNearFar();
     const modeFlag = this.renderMode === "cloudSky" ? 1 : 0;
+    const densitySourceFlag = this.densitySource === "neural" ? 1 : 0;
 
     const uniformData = new Float32Array([
       pos[0],
@@ -930,7 +1111,7 @@ export class WebGPURenderer {
       modeFlag,
       this.sigma,
       this.phaseG,
-      0,
+      densitySourceFlag,
       this.sunDirection[0],
       this.sunDirection[1],
       this.sunDirection[2],
@@ -954,5 +1135,6 @@ export class WebGPURenderer {
     pass.draw(6, 1, 0, 0);
     pass.end();
     this.device.queue.submit([encoder.finish()]);
+    this.frameDirty = false;
   }
 }

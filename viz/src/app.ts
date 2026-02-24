@@ -4,6 +4,7 @@ import { WebGPURenderer, type RenderMode } from "./webgpu/renderer";
 const DEFAULT_SUN_PITCH = -3;
 const DEFAULT_SUN_AZIMUTH = -180;
 const DEFAULT_NOISE_FLOOR = 0.14;
+const MAX_RENDER_DPR = 1.5;
 
 export class App {
   private readonly canvas: HTMLCanvasElement;
@@ -18,6 +19,7 @@ export class App {
   private readonly sunAzimuthValue: HTMLSpanElement;
   private renderer: WebGPURenderer | null = null;
   private readonly camera: OrbitCamera;
+  private needsRender = true;
 
   constructor(container: HTMLElement) {
     const controlsStack = document.createElement("div");
@@ -167,51 +169,59 @@ export class App {
     this.modeSelect.addEventListener("change", () => {
       const mode = this.modeSelect.value as RenderMode;
       this.renderer?.setRenderMode(mode);
+      this.needsRender = true;
     });
 
     this.densitySlider.addEventListener("input", () => {
       const value = Number(this.densitySlider.value);
       this.densityValue.textContent = value.toFixed(2);
       this.renderer?.setCloudDensity(value);
+      this.needsRender = true;
     });
 
     this.noiseFloorSlider.addEventListener("input", () => {
       const value = Number(this.noiseFloorSlider.value);
       this.noiseFloorValue.textContent = value.toFixed(3);
       this.renderer?.setReconstructionNoiseFloor(value);
+      this.needsRender = true;
     });
 
     this.sunPitchSlider.addEventListener("input", () => {
       const pitch = Number(this.sunPitchSlider.value);
       this.sunPitchValue.textContent = `${Math.round(pitch)}deg`;
       this.renderer?.setSunAngles(pitch, Number(this.sunAzimuthSlider.value));
+      this.needsRender = true;
     });
 
     this.sunAzimuthSlider.addEventListener("input", () => {
       const azimuth = Number(this.sunAzimuthSlider.value);
       this.sunAzimuthValue.textContent = `${Math.round(azimuth)}deg`;
       this.renderer?.setSunAngles(Number(this.sunPitchSlider.value), azimuth);
+      this.needsRender = true;
     });
   }
 
   async start(): Promise<void> {
     this.renderer = await WebGPURenderer.create(this.canvas);
+    this.renderer.setDensitySource("neural");
     this.renderer.setRenderMode(this.modeSelect.value as RenderMode);
     this.renderer.setCloudDensity(Number(this.densitySlider.value));
     this.renderer.setReconstructionNoiseFloor(Number(this.noiseFloorSlider.value));
     this.renderer.setSunAngles(Number(this.sunPitchSlider.value), Number(this.sunAzimuthSlider.value));
+    this.needsRender = true;
     window.addEventListener("resize", this.handleResize);
     this.handleResize();
     requestAnimationFrame(this.frame);
   }
 
   private readonly handleResize = (): void => {
-    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const dpr = Math.min(MAX_RENDER_DPR, Math.max(1, window.devicePixelRatio || 1));
     const width = Math.max(1, Math.floor(window.innerWidth * dpr));
     const height = Math.max(1, Math.floor(window.innerHeight * dpr));
     if (this.canvas.width !== width || this.canvas.height !== height) {
       this.canvas.width = width;
       this.canvas.height = height;
+      this.needsRender = true;
     }
     this.camera.setViewportSize(width, height);
   };
@@ -220,8 +230,14 @@ export class App {
     if (!this.renderer) {
       return;
     }
-    this.camera.update();
-    this.renderer.render(this.camera);
+    const cameraChanged = this.camera.update();
+    if (cameraChanged) {
+      this.needsRender = true;
+    }
+    if (this.needsRender || this.renderer.hasPendingRenderWork()) {
+      this.renderer.render(this.camera);
+      this.needsRender = false;
+    }
     requestAnimationFrame(this.frame);
   };
 }

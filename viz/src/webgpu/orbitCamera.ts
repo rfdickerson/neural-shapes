@@ -15,6 +15,7 @@ export class OrbitCamera {
   private readonly maxRadius = 8.0;
   private readonly minPitch = -1.45;
   private readonly maxPitch = 1.45;
+  private dirty = true;
 
   constructor(canvas: HTMLCanvasElement) {
     canvas.addEventListener("pointerdown", (ev) => {
@@ -41,6 +42,7 @@ export class OrbitCamera {
       this.yaw += dx * 0.005;
       this.pitch -= dy * 0.005;
       this.pitch = Math.max(this.minPitch, Math.min(this.maxPitch, this.pitch));
+      this.dirty = true;
     });
 
     canvas.addEventListener(
@@ -49,6 +51,7 @@ export class OrbitCamera {
         ev.preventDefault();
         const delta = ev.deltaY * 0.0015;
         this.radius = Math.max(this.minRadius, Math.min(this.maxRadius, this.radius * (1 + delta)));
+        this.dirty = true;
       },
       { passive: false }
     );
@@ -57,9 +60,14 @@ export class OrbitCamera {
   setViewportSize(width: number, height: number): void {
     this.viewportWidth = Math.max(1, width);
     this.viewportHeight = Math.max(1, height);
+    this.dirty = true;
   }
 
-  update(): void {}
+  update(): boolean {
+    const changed = this.dirty;
+    this.dirty = false;
+    return changed;
+  }
 
   getPosition(): Vec3 {
     const cp = Math.cos(this.pitch);

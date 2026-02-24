@@ -1,3 +1,5 @@
+enable f16;
+
 struct VSOut {
   @builtin(position) position: vec4f,
   @location(0) uv: vec2f,
@@ -8,19 +10,50 @@ struct CameraUniform {
   focus: vec4f,
   up: vec4f,
   params: vec4f, // x: aspect, y: tanHalfFov, z: near, w: far
-  renderParams: vec4f, // x: mode (0 fogOnly, 1 cloudSky), y: sigma, z: phase g
+  renderParams: vec4f, // x: mode, y: sigma, z: phase g, w: density source (0 texture, 1 neural)
   sunDirectionIntensity: vec4f, // xyz: sun direction, w: intensity
 }
 
 const kCloudWorldHalfExtents = vec3f(0.8112, 0.5515, 1.0);
 const kCloudWorldMin = -kCloudWorldHalfExtents;
 const kCloudWorldMax = kCloudWorldHalfExtents;
+const ENCODED_DIM = 39u;
+const MAX_HIDDEN = 256u;
+const ISO_ENTRY_THRESHOLD = 0.08;
+const SHELL_BAND_MIN = 0.03;
+const SHELL_BAND_MAX = 0.72;
+const NEURAL_SHELL_DECAY = 0.35;
+const NEURAL_RAY_FRACTION = 0.45;
+
+struct MLPMetadata {
+  inputDim: u32,
+  hidden0: u32,
+  hidden1: u32,
+  w0Offset: u32,
+  b0Offset: u32,
+  w1Offset: u32,
+  b1Offset: u32,
+  w2Offset: u32,
+  b2Offset: u32,
+  fourierLevels: u32,
+  _pad0: u32,
+  _pad1: u32,
+}
+
+struct FillParams {
+  baselineHalfExtents: vec4<f32>, // xyz = half extents
+  params: vec4<f32>, // x=baseline sharpness, y=noise floor, z=soft knee width, w=baseline scale
+}
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 @group(0) @binding(1) var volumeSampler: sampler;
 @group(0) @binding(2) var volumeTex: texture_3d<f32>;
 @group(0) @binding(3) var sunTransmittanceTex: texture_3d<f32>;
 @group(0) @binding(4) var multiScatterTex: texture_3d<f32>;
+@group(0) @binding(5) var<storage, read> mlpWeights: array<f16>;
+@group(0) @binding(6) var<uniform> mlpMeta: MLPMetadata;
+@group(0) @binding(7) var<uniform> fillParams: FillParams;
+@group(0) @binding(8) var blueNoiseTex: texture_2d<f32>;
 
 fn worldToLocal(pWorld: vec3f) -> vec3f {
   return pWorld / kCloudWorldHalfExtents;
@@ -47,7 +80,114 @@ fn vsMain(@builtin(vertex_index) vid: u32) -> VSOut {
   return out;
 }
 
-fn density(p: vec3f) -> f32 {
+fn sdBox(p: vec3<f32>, halfExtents: vec3<f32>) -> f32 {
+  let q = abs(p) - halfExtents;
+  let outside = length(max(q, vec3<f32>(0.0)));
+  let inside = min(max(max(q.x, q.y), q.z), 0.0);
+  return outside + inside;
+}
+
+fn smoothBoxBaseline(p: vec3<f32>) -> f32 {
+  let sdf = sdBox(p, fillParams.baselineHalfExtents.xyz);
+  return 1.0 / (1.0 + exp(fillParams.params.x * sdf));
+}
+
+fn encodePosition(p: vec3<f32>) -> array<f32, ENCODED_DIM> {
+  var out: array<f32, ENCODED_DIM>;
+  var idx = 0u;
+
+  out[idx] = p.x;
+  idx++;
+  out[idx] = p.y;
+  idx++;
+  out[idx] = p.z;
+  idx++;
+
+  for (var i = 0u; i < mlpMeta.fourierLevels; i++) {
+    let freq = pow(2.0, f32(i));
+    out[idx] = sin(freq * p.x);
+    idx++;
+    out[idx] = sin(freq * p.y);
+    idx++;
+    out[idx] = sin(freq * p.z);
+    idx++;
+    out[idx] = cos(freq * p.x);
+    idx++;
+    out[idx] = cos(freq * p.y);
+    idx++;
+    out[idx] = cos(freq * p.z);
+    idx++;
+  }
+
+  return out;
+}
+
+fn linearFromEncoded(
+  input: array<f32, ENCODED_DIM>,
+  inputDim: u32,
+  outputDim: u32,
+  wOffset: u32,
+  bOffset: u32
+) -> array<f32, MAX_HIDDEN> {
+  var out: array<f32, MAX_HIDDEN>;
+
+  for (var i = 0u; i < outputDim; i++) {
+    var sum = f32(mlpWeights[bOffset + i]);
+    for (var j = 0u; j < inputDim; j++) {
+      let w = f32(mlpWeights[wOffset + i * inputDim + j]);
+      sum += w * input[j];
+    }
+    out[i] = max(sum, 0.0);
+  }
+  return out;
+}
+
+fn linearFromHidden(
+  input: array<f32, MAX_HIDDEN>,
+  inputDim: u32,
+  outputDim: u32,
+  wOffset: u32,
+  bOffset: u32
+) -> array<f32, MAX_HIDDEN> {
+  var out: array<f32, MAX_HIDDEN>;
+
+  for (var i = 0u; i < outputDim; i++) {
+    var sum = f32(mlpWeights[bOffset + i]);
+    for (var j = 0u; j < inputDim; j++) {
+      let w = f32(mlpWeights[wOffset + i * inputDim + j]);
+      sum += w * input[j];
+    }
+    out[i] = max(sum, 0.0);
+  }
+  return out;
+}
+
+fn mlpResidual(p: vec3<f32>) -> f32 {
+  let encoded = encodePosition(p);
+  let h0 = linearFromEncoded(
+    encoded,
+    mlpMeta.inputDim,
+    mlpMeta.hidden0,
+    mlpMeta.w0Offset,
+    mlpMeta.b0Offset
+  );
+  let h1 = linearFromHidden(
+    h0,
+    mlpMeta.hidden0,
+    mlpMeta.hidden1,
+    mlpMeta.w1Offset,
+    mlpMeta.b1Offset
+  );
+
+  var sum = f32(mlpWeights[mlpMeta.b2Offset]);
+  for (var i = 0u; i < mlpMeta.hidden1; i++) {
+    let w = f32(mlpWeights[mlpMeta.w2Offset + i]);
+    sum += w * h1[i];
+  }
+  return sum;
+}
+
+fn densityTexture(p: vec3f) -> f32 {
   let uvw = localToUvw(worldToLocal(p));
   if (any(uvw < vec3f(0.0)) || any(uvw > vec3f(1.0))) {
     return 0.0;
@@ -71,19 +211,6 @@ fn sampleMultiScatter(p: vec3f) -> vec3f {
   return max(textureSampleLevel(multiScatterTex, volumeSampler, uvw, 0.0).xyz, vec3f(0.0));
 }
 
-fn estimateNormal(p: vec3f, epsScalar: f32) -> vec3f {
-  let eps = vec3f(epsScalar, 0.0, 0.0);
-  let gx = density(p + eps.xyy) - density(p - eps.xyy);
-  let gy = density(p + eps.yxy) - density(p - eps.yxy);
-  let gz = density(p + eps.yyx) - density(p - eps.yyx);
-  let g = vec3f(gx, gy, gz);
-  let len2 = dot(g, g);
-  if (len2 < 1e-8) {
-    return vec3f(0.0, 0.0, 1.0);
-  }
-  return normalize(g);
-}
-
 fn intersectAabb(rayOrigin: vec3f, rayDir: vec3f, bmin: vec3f, bmax: vec3f) -> vec2f {
   let dirSign = select(vec3f(1.0), vec3f(-1.0), rayDir < vec3f(0.0));
   let invDir = dirSign / max(abs(rayDir), vec3f(1e-6));
@@ -94,11 +221,6 @@ fn intersectAabb(rayOrigin: vec3f, rayDir: vec3f, bmin: vec3f, bmax: vec3f) -> v
   let tEnter = max(max(tsmaller.x, tsmaller.y), tsmaller.z);
   let tExit = min(min(tbigger.x, tbigger.y), tbigger.z);
   return vec2f(tEnter, tExit);
-}
-
-fn hash(p: vec2f) -> f32 {
-  let h = dot(p, vec2f(127.1, 311.7));
-  return fract(sin(h) * 43758.5453123);
 }
 
 fn henyeyGreenstein(cosTheta: f32, g: f32) -> f32 {
@@ -165,6 +287,7 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
   let modeFlag = camera.renderParams.x;
   let sigma = max(camera.renderParams.y, 0.01);
   let basePhaseG = clamp(camera.renderParams.z, 0.0, 0.95);
+  let useNeuralRefine = camera.renderParams.w > 0.5;
   let sunDir = normalize(camera.sunDirectionIntensity.xyz);
   let sunIntensity = max(camera.sunDirectionIntensity.w, 0.01);
 
@@ -191,10 +314,14 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
   var transmittance = 1.0;
   var accum = 0.0;
   var cloudAccum = vec3f(0.0);
-  let maxSteps = 192u;
+  let maxSteps = 128u;
   let totalDist = tEnd - tStart;
   let stepSize = totalDist / f32(maxSteps);
-  let jitterFactor = hash(in.uv);
+  let noiseDims = textureDimensions(blueNoiseTex);
+  let pixelCoord = vec2u(u32(max(i32(in.position.x), 0)), u32(max(i32(in.position.y), 0)));
+  let noiseCoord = vec2u(pixelCoord.x % noiseDims.x, pixelCoord.y % noiseDims.y);
+  let noiseSample = textureLoad(blueNoiseTex, vec2i(i32(noiseCoord.x), i32(noiseCoord.y)), 0);
+  let jitterFactor = noiseSample.r;
   let sunset = 1.0 - smoothstep(0.02, 0.55, sunDir.y);
   let autoPhaseG = clamp(mix(basePhaseG, min(basePhaseG + 0.08, 0.84), sunset), 0.0, 0.90);
   let sunViewCos = clamp(dot(rayDir, sunDir), -1.0, 1.0);
@@ -206,39 +333,72 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
   let ambientSky = skyColor(vec3f(0.0, 1.0, 0.0), sunDir, sunIntensity);
   let ambientBase = mix(vec3f(0.08, 0.10, 0.14), vec3f(0.18, 0.10, 0.16), sunset);
   let ambientTerm = mix(ambientBase, ambientSky, 0.35) * cloudAlbedo;
+  let allowNeuralRay = noiseSample.b < NEURAL_RAY_FRACTION;
+  var prevDensity = 0.0;
+  var boundaryRefined = false;
+  var boundaryScale = 1.0;
+  var boundaryAnchor = -1.0;
 
   var t = tStart + jitterFactor * stepSize;
   for (var i = 0u; i < maxSteps; i++) {
-    if (transmittance < 0.005 || t > tEnd) {
+    if (transmittance < 0.01 || t > tEnd) {
       break;
     }
     let p = camPos + rayDir * t;
-    let d = density(p);
-    let densityMask = smoothstep(0.02, 0.24, d);
-    let localStep = mix(stepSize * 2.0, stepSize * 0.4, densityMask);
-    if (d <= 1e-4) {
+    let d = densityTexture(p);
+    let edgeBandIn = smoothstep(0.02, 0.20, d);
+    let edgeBandOut = 1.0 - smoothstep(0.36, 0.75, d);
+    let edgeBand = clamp(edgeBandIn * edgeBandOut, 0.0, 1.0);
+    let stepJitter = mix(0.92, 1.08, fract(noiseSample.g + f32(i) * 0.754877666));
+    let localStep = mix(stepSize * 2.2, stepSize * 0.45, edgeBand) * stepJitter;
+    let pMid = camPos + rayDir * (t + localStep * 0.5);
+    let dMid = densityTexture(pMid);
+    if (dMid <= 1e-4) {
+      prevDensity = 0.0;
       t += localStep;
       continue;
     }
-    let sigmaT = d * sigma;
+    var refinedDensity = dMid;
+    let crossingIso = prevDensity < ISO_ENTRY_THRESHOLD && dMid >= ISO_ENTRY_THRESHOLD;
+    if (useNeuralRefine && allowNeuralRay && !boundaryRefined && crossingIso && transmittance > 0.05) {
+      let pLocal = worldToLocal(pMid);
+      let macroDensity = fillParams.params.w * smoothBoxBaseline(pLocal);
+      let residual = mlpResidual(pLocal);
+      let neuralRaw = clamp(macroDensity + residual, 0.0, 1.0);
+      let floor = clamp(fillParams.params.y, 0.0, 1.0);
+      let knee = max(fillParams.params.z, 1.0e-4);
+      let gate = smoothstep(floor, floor + knee, neuralRaw);
+      let neuralDensity = neuralRaw * gate;
+      boundaryScale = clamp(neuralDensity / max(dMid, 1.0e-3), 0.65, 1.5);
+      boundaryAnchor = t;
+      boundaryRefined = true;
+    }
+    if (boundaryRefined) {
+      let shellIn = smoothstep(SHELL_BAND_MIN, 0.22, dMid);
+      let shellOut = 1.0 - smoothstep(0.36, SHELL_BAND_MAX, dMid);
+      let shellBand = clamp(shellIn * shellOut, 0.0, 1.0);
+      let distSteps = abs(t - boundaryAnchor) / max(stepSize, 1.0e-4);
+      let shellFade = exp(-distSteps * NEURAL_SHELL_DECAY);
+      let shellWeight = shellBand * shellFade;
+      refinedDensity = clamp(mix(dMid, dMid * boundaryScale, shellWeight), 0.0, 1.0);
+    }
+    let densityShaped = mix(refinedDensity, smoothstep(0.02, 0.50, refinedDensity), 0.35);
+    let sigmaT = densityShaped * sigma;
     let segmentTransmittance = exp(-sigmaT * localStep);
     let contrib = transmittance * (1.0 - segmentTransmittance);
     if (modeFlag > 0.5) {
-      let sunTr = sampleSunTransmittance(p);
-      let n = estimateNormal(p, localStep * 0.75);
-      let ndotl = max(dot(n, sunDir), 0.0);
-      let viewFacing = max(dot(n, -rayDir), 0.0);
-      let rim = pow(1.0 - viewFacing, 2.0);
-
-      let direct = sunRadiance * sunPhase * sunTr * cloudAlbedo * (0.95 + 0.05 * ndotl);
-      let indirect = sampleMultiScatter(p) * d * 0.8;
-      let edgeAccent = 1.0 + rim * 0.4 + forwardScatterBoost * 0.6;
+      let sunTr = sampleSunTransmittance(pMid);
+      let indirectMs = sampleMultiScatter(pMid);
+      let direct = sunRadiance * sunPhase * sunTr * cloudAlbedo;
+      let indirect = indirectMs * densityShaped * 0.8;
+      let edgeAccent = 1.0 + forwardScatterBoost * 0.45;
       let scattering = ambientTerm * 0.88 + direct + indirect;
       cloudAccum += scattering * contrib * edgeAccent;
     } else {
       accum += contrib;
     }
     transmittance *= segmentTransmittance;
+    prevDensity = dMid;
     t += localStep;
   }
 
