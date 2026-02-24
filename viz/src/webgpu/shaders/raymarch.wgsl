@@ -12,11 +12,23 @@ struct CameraUniform {
   sunDirectionIntensity: vec4f, // xyz: sun direction, w: intensity
 }
 
+const kCloudWorldHalfExtents = vec3f(0.8112, 0.5515, 1.0);
+const kCloudWorldMin = -kCloudWorldHalfExtents;
+const kCloudWorldMax = kCloudWorldHalfExtents;
+
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 @group(0) @binding(1) var volumeSampler: sampler;
 @group(0) @binding(2) var volumeTex: texture_3d<f32>;
 @group(0) @binding(3) var sunTransmittanceTex: texture_3d<f32>;
 @group(0) @binding(4) var multiScatterTex: texture_3d<f32>;
+
+fn worldToLocal(pWorld: vec3f) -> vec3f {
+  return pWorld / kCloudWorldHalfExtents;
+}
+
+fn localToUvw(pLocal: vec3f) -> vec3f {
+  return pLocal * 0.5 + vec3f(0.5);
+}
 
 @vertex
 fn vsMain(@builtin(vertex_index) vid: u32) -> VSOut {
@@ -36,7 +48,7 @@ fn vsMain(@builtin(vertex_index) vid: u32) -> VSOut {
 }
 
 fn density(p: vec3f) -> f32 {
-  let uvw = p * 0.5 + vec3f(0.5);
+  let uvw = localToUvw(worldToLocal(p));
   if (any(uvw < vec3f(0.0)) || any(uvw > vec3f(1.0))) {
     return 0.0;
   }
@@ -44,7 +56,7 @@ fn density(p: vec3f) -> f32 {
 }
 
 fn sampleSunTransmittance(p: vec3f) -> f32 {
-  let uvw = p * 0.5 + vec3f(0.5);
+  let uvw = localToUvw(worldToLocal(p));
   if (any(uvw < vec3f(0.0)) || any(uvw > vec3f(1.0))) {
     return 1.0;
   }
@@ -52,7 +64,7 @@ fn sampleSunTransmittance(p: vec3f) -> f32 {
 }
 
 fn sampleMultiScatter(p: vec3f) -> vec3f {
-  let uvw = p * 0.5 + vec3f(0.5);
+  let uvw = localToUvw(worldToLocal(p));
   if (any(uvw < vec3f(0.0)) || any(uvw > vec3f(1.0))) {
     return vec3f(0.0);
   }
@@ -164,8 +176,8 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
   let ndc = vec2f(in.uv.x * 2.0 - 1.0, in.uv.y * 2.0 - 1.0);
   let rayDir = normalize(forward + right * ndc.x * aspect * tanHalfFov + up * ndc.y * tanHalfFov);
 
-  let boundsMin = vec3f(-1.0);
-  let boundsMax = vec3f(1.0);
+  let boundsMin = kCloudWorldMin;
+  let boundsMax = kCloudWorldMax;
   let hit = intersectAabb(camPos, rayDir, boundsMin, boundsMax);
   let tStart = max(nearT, hit.x);
   let tEnd = min(farT, hit.y);
@@ -218,7 +230,7 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
       let viewFacing = max(dot(n, -rayDir), 0.0);
       let rim = pow(1.0 - viewFacing, 2.0);
 
-      let direct = sunRadiance * sunPhase * sunTr * cloudAlbedo * (0.90 + 0.10 * ndotl);
+      let direct = sunRadiance * sunPhase * sunTr * cloudAlbedo * (0.95 + 0.05 * ndotl);
       let indirect = sampleMultiScatter(p) * d * 0.8;
       let edgeAccent = 1.0 + rim * 0.4 + forwardScatterBoost * 0.6;
       let scattering = ambientTerm * 0.88 + direct + indirect;

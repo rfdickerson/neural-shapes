@@ -1,5 +1,6 @@
-const kCloudAabbMin = vec3f(-1.0, -1.0, -1.0);
-const kCloudAabbMax = vec3f(1.0, 1.0, 1.0);
+const kCloudWorldHalfExtents = vec3f(0.8112, 0.5515, 1.0);
+const kCloudAabbMin = -kCloudWorldHalfExtents;
+const kCloudAabbMax = kCloudWorldHalfExtents;
 
 struct LightingParams {
   sunDirectionIntensity: vec4f,
@@ -11,6 +12,10 @@ struct LightingParams {
 @group(0) @binding(1) var densitySampler: sampler;
 @group(0) @binding(2) var sunTransmittanceOut: texture_storage_3d<rgba16float, write>;
 @group(0) @binding(3) var<uniform> params: LightingParams;
+
+fn worldToLocal(pWorld: vec3f) -> vec3f {
+  return pWorld / kCloudWorldHalfExtents;
+}
 
 fn hash3(p: vec3u) -> u32 {
   var h = p.x * 747796405u;
@@ -25,7 +30,7 @@ fn hash3(p: vec3u) -> u32 {
 }
 
 fn sampleDensity(p: vec3f) -> f32 {
-  let uvw = (p - kCloudAabbMin) / (kCloudAabbMax - kCloudAabbMin);
+  let uvw = worldToLocal(p) * 0.5 + vec3f(0.5);
   if (any(uvw < vec3f(0.0)) || any(uvw > vec3f(1.0))) {
     return 0.0;
   }

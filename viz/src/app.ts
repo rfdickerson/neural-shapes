@@ -1,21 +1,17 @@
 import { OrbitCamera } from "./webgpu/orbitCamera";
 import { WebGPURenderer, type RenderMode } from "./webgpu/renderer";
 
-const DEFAULT_SUN_PITCH = 51;
-const DEFAULT_SUN_AZIMUTH = 36;
-const DEFAULT_DETAIL_SCALE = 4.6;
-const DEFAULT_EROSION_STRENGTH = 0.48;
+const DEFAULT_SUN_PITCH = -3;
+const DEFAULT_SUN_AZIMUTH = -180;
+const DEFAULT_NOISE_FLOOR = 0.14;
 
 export class App {
   private readonly canvas: HTMLCanvasElement;
   private readonly modeSelect: HTMLSelectElement;
-  private readonly detailNoiseToggle: HTMLInputElement;
-  private readonly detailScaleSlider: HTMLInputElement;
-  private readonly detailScaleValue: HTMLSpanElement;
-  private readonly erosionStrengthSlider: HTMLInputElement;
-  private readonly erosionStrengthValue: HTMLSpanElement;
   private readonly densitySlider: HTMLInputElement;
   private readonly densityValue: HTMLSpanElement;
+  private readonly noiseFloorSlider: HTMLInputElement;
+  private readonly noiseFloorValue: HTMLSpanElement;
   private readonly sunPitchSlider: HTMLInputElement;
   private readonly sunPitchValue: HTMLSpanElement;
   private readonly sunAzimuthSlider: HTMLInputElement;
@@ -52,71 +48,6 @@ export class App {
     modeRow.append(label, this.modeSelect);
     cloudPanel.appendChild(modeRow);
 
-    const detailLabel = document.createElement("label");
-    detailLabel.className = "controls__label";
-    detailLabel.htmlFor = "detail-noise-toggle";
-    detailLabel.textContent = "Detail Noise";
-
-    this.detailNoiseToggle = document.createElement("input");
-    this.detailNoiseToggle.id = "detail-noise-toggle";
-    this.detailNoiseToggle.type = "checkbox";
-    this.detailNoiseToggle.className = "controls__checkbox";
-    this.detailNoiseToggle.checked = true;
-    const detailRow = document.createElement("div");
-    detailRow.className = "controls__row controls__row--toggle";
-    detailRow.append(detailLabel, this.detailNoiseToggle);
-    cloudPanel.appendChild(detailRow);
-
-    const detailScaleLabel = document.createElement("label");
-    detailScaleLabel.className = "controls__label";
-    detailScaleLabel.htmlFor = "detail-scale-slider";
-    detailScaleLabel.textContent = "Detail Scale";
-
-    this.detailScaleSlider = document.createElement("input");
-    this.detailScaleSlider.id = "detail-scale-slider";
-    this.detailScaleSlider.className = "controls__range";
-    this.detailScaleSlider.type = "range";
-    this.detailScaleSlider.min = "0.5";
-    this.detailScaleSlider.max = "10.0";
-    this.detailScaleSlider.step = "0.05";
-    this.detailScaleSlider.value = DEFAULT_DETAIL_SCALE.toFixed(2);
-
-    this.detailScaleValue = document.createElement("span");
-    this.detailScaleValue.className = "controls__value";
-    this.detailScaleValue.textContent = Number(this.detailScaleSlider.value).toFixed(2);
-    const detailScaleField = document.createElement("div");
-    detailScaleField.className = "controls__field";
-    detailScaleField.append(this.detailScaleSlider, this.detailScaleValue);
-    const detailScaleRow = document.createElement("div");
-    detailScaleRow.className = "controls__row";
-    detailScaleRow.append(detailScaleLabel, detailScaleField);
-    cloudPanel.appendChild(detailScaleRow);
-
-    const erosionStrengthLabel = document.createElement("label");
-    erosionStrengthLabel.className = "controls__label";
-    erosionStrengthLabel.htmlFor = "erosion-strength-slider";
-    erosionStrengthLabel.textContent = "Erosion Strength";
-
-    this.erosionStrengthSlider = document.createElement("input");
-    this.erosionStrengthSlider.id = "erosion-strength-slider";
-    this.erosionStrengthSlider.className = "controls__range";
-    this.erosionStrengthSlider.type = "range";
-    this.erosionStrengthSlider.min = "0.0";
-    this.erosionStrengthSlider.max = "1.5";
-    this.erosionStrengthSlider.step = "0.02";
-    this.erosionStrengthSlider.value = DEFAULT_EROSION_STRENGTH.toFixed(2);
-
-    this.erosionStrengthValue = document.createElement("span");
-    this.erosionStrengthValue.className = "controls__value";
-    this.erosionStrengthValue.textContent = Number(this.erosionStrengthSlider.value).toFixed(2);
-    const erosionStrengthField = document.createElement("div");
-    erosionStrengthField.className = "controls__field";
-    erosionStrengthField.append(this.erosionStrengthSlider, this.erosionStrengthValue);
-    const erosionStrengthRow = document.createElement("div");
-    erosionStrengthRow.className = "controls__row";
-    erosionStrengthRow.append(erosionStrengthLabel, erosionStrengthField);
-    cloudPanel.appendChild(erosionStrengthRow);
-
     const densityLabel = document.createElement("label");
     densityLabel.className = "controls__label";
     densityLabel.htmlFor = "density-slider";
@@ -129,7 +60,7 @@ export class App {
     this.densitySlider.min = "0.2";
     this.densitySlider.max = "12.0";
     this.densitySlider.step = "0.05";
-    this.densitySlider.value = "4.0";
+    this.densitySlider.value = "5.85";
 
     this.densityValue = document.createElement("span");
     this.densityValue.className = "controls__value";
@@ -141,6 +72,31 @@ export class App {
     densityRow.className = "controls__row";
     densityRow.append(densityLabel, densityField);
     cloudPanel.appendChild(densityRow);
+
+    const noiseFloorLabel = document.createElement("label");
+    noiseFloorLabel.className = "controls__label";
+    noiseFloorLabel.htmlFor = "noise-floor-slider";
+    noiseFloorLabel.textContent = "Noise Floor";
+
+    this.noiseFloorSlider = document.createElement("input");
+    this.noiseFloorSlider.id = "noise-floor-slider";
+    this.noiseFloorSlider.className = "controls__range";
+    this.noiseFloorSlider.type = "range";
+    this.noiseFloorSlider.min = "0.00";
+    this.noiseFloorSlider.max = "0.20";
+    this.noiseFloorSlider.step = "0.002";
+    this.noiseFloorSlider.value = DEFAULT_NOISE_FLOOR.toFixed(3);
+
+    this.noiseFloorValue = document.createElement("span");
+    this.noiseFloorValue.className = "controls__value";
+    this.noiseFloorValue.textContent = Number(this.noiseFloorSlider.value).toFixed(3);
+    const noiseFloorField = document.createElement("div");
+    noiseFloorField.className = "controls__field";
+    noiseFloorField.append(this.noiseFloorSlider, this.noiseFloorValue);
+    const noiseFloorRow = document.createElement("div");
+    noiseFloorRow.className = "controls__row";
+    noiseFloorRow.append(noiseFloorLabel, noiseFloorField);
+    cloudPanel.appendChild(noiseFloorRow);
 
     const sunPanel = document.createElement("section");
     sunPanel.className = "controls-panel";
@@ -213,26 +169,16 @@ export class App {
       this.renderer?.setRenderMode(mode);
     });
 
-    this.detailNoiseToggle.addEventListener("change", () => {
-      this.renderer?.setDetailNoiseEnabled(this.detailNoiseToggle.checked);
-    });
-
-    this.detailScaleSlider.addEventListener("input", () => {
-      const value = Number(this.detailScaleSlider.value);
-      this.detailScaleValue.textContent = value.toFixed(2);
-      this.renderer?.setDetailScale(value);
-    });
-
-    this.erosionStrengthSlider.addEventListener("input", () => {
-      const value = Number(this.erosionStrengthSlider.value);
-      this.erosionStrengthValue.textContent = value.toFixed(2);
-      this.renderer?.setErosionStrength(value);
-    });
-
     this.densitySlider.addEventListener("input", () => {
       const value = Number(this.densitySlider.value);
       this.densityValue.textContent = value.toFixed(2);
       this.renderer?.setCloudDensity(value);
+    });
+
+    this.noiseFloorSlider.addEventListener("input", () => {
+      const value = Number(this.noiseFloorSlider.value);
+      this.noiseFloorValue.textContent = value.toFixed(3);
+      this.renderer?.setReconstructionNoiseFloor(value);
     });
 
     this.sunPitchSlider.addEventListener("input", () => {
@@ -251,10 +197,8 @@ export class App {
   async start(): Promise<void> {
     this.renderer = await WebGPURenderer.create(this.canvas);
     this.renderer.setRenderMode(this.modeSelect.value as RenderMode);
-    this.renderer.setDetailNoiseEnabled(this.detailNoiseToggle.checked);
-    this.renderer.setDetailScale(Number(this.detailScaleSlider.value));
-    this.renderer.setErosionStrength(Number(this.erosionStrengthSlider.value));
     this.renderer.setCloudDensity(Number(this.densitySlider.value));
+    this.renderer.setReconstructionNoiseFloor(Number(this.noiseFloorSlider.value));
     this.renderer.setSunAngles(Number(this.sunPitchSlider.value), Number(this.sunAzimuthSlider.value));
     window.addEventListener("resize", this.handleResize);
     this.handleResize();

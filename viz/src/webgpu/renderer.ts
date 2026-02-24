@@ -18,11 +18,10 @@ const DEFAULT_ALBEDO = 0.92;
 const LIGHT_MARCH_STEPS = 96;
 const MULTISCATTER_ITERS = 8;
 const MULTISCATTER_LAMBDA = 0.58;
-const DETAIL_TEXTURE_SIZE = 64;
-const DETAIL_SCALE = 4.6;
-const DETAIL_EROSION_STRENGTH = 0.48;
-const DETAIL_EDGE_START = 0.05;
-const DETAIL_EDGE_END = 0.66;
+const DEFAULT_RECON_NOISE_FLOOR = 0.02;
+const RECON_NOISE_KNEE = 0.03;
+const DEFAULT_BASELINE_HALF_EXTENTS: [number, number, number] = [0.6, 0.25, 0.6];
+const DEFAULT_BASELINE_SHARPNESS = 14.0;
 
 export type RenderMode = "cloudSky" | "fogOnly";
 
@@ -42,6 +41,11 @@ interface ExportMetadata {
   network: {
     layers: number[];
   };
+  baseline?: {
+    type?: string;
+    half_extents?: number[];
+    sharpness?: number;
+  };
   offsets: Record<string, number>;
   total_floats: number;
 }
@@ -49,6 +53,7 @@ interface ExportMetadata {
 interface LoadedMlpData {
   weightsFp16: Uint16Array<ArrayBuffer>;
   metaUniform: Uint32Array<ArrayBuffer>;
+  fillParamsUniform: Float32Array<ArrayBuffer>;
 }
 
 const f32Scratch = new Float32Array(1);
@@ -234,7 +239,31 @@ async function loadExportedMlpData(): Promise<LoadedMlpData> {
   metaUniform[10] = 0;
   metaUniform[11] = 0;
 
-  return { weightsFp16, metaUniform };
+  let baselineHalfExtents = DEFAULT_BASELINE_HALF_EXTENTS;
+  if (meta.baseline?.half_extents !== undefined) {
+    const extents = meta.baseline.half_extents;
+    if (!Array.isArray(extents) || extents.length !== 3 || !extents.every((x) => Number.isFinite(x) && x > 0)) {
+      throw new Error("MLP metadata baseline.half_extents must be a 3-element positive numeric array.");
+    }
+    baselineHalfExtents = [extents[0], extents[1], extents[2]];
+  }
+  const baselineSharpnessRaw = meta.baseline?.sharpness;
+  const baselineSharpness =
+    baselineSharpnessRaw === undefined
+      ? DEFAULT_BASELINE_SHARPNESS
+      : Number.isFinite(baselineSharpnessRaw) && baselineSharpnessRaw > 0
+        ? baselineSharpnessRaw
+        : (() => {
+            throw new Error("MLP metadata baseline.sharpness must be a positive number.");
+          })();
+
+  const fillParamsUniform = createReconstructionParamsBufferData(
+    DEFAULT_RECON_NOISE_FLOOR,
+    baselineHalfExtents,
+    baselineSharpness
+  );
+
+  return { weightsFp16, metaUniform, fillParamsUniform };
 }
 
 function validateLoadedModel(metaUniform: Uint32Array<ArrayBuffer>): void {
@@ -275,185 +304,25 @@ function createLightingParamsBufferData(
   return data;
 }
 
-function clamp01(value: number): number {
-  return Math.max(0, Math.min(1, value));
-}
-
-function smoothstep(edge0: number, edge1: number, x: number): number {
-  const denom = edge1 - edge0;
-  if (Math.abs(denom) < 1e-6) {
-    return x >= edge1 ? 1 : 0;
-  }
-  const t = clamp01((x - edge0) / denom);
-  return t * t * (3 - 2 * t);
-}
-
-function fract(value: number): number {
-  return value - Math.floor(value);
-}
-
-function lerp(a: number, b: number, t: number): number {
-  return a + (b - a) * t;
-}
-
 function densityControlToSigma(value: number): number {
   // Nonlinear remap so UI density values produce stronger extinction in-cloud.
   const d = Math.max(0.2, Math.min(value, 12.0));
   return d * (1.25 + 0.22 * d);
 }
 
-function wrapIndex(value: number, size: number): number {
-  const r = value % size;
-  return r < 0 ? r + size : r;
-}
-
-function hash3ToUnit(x: number, y: number, z: number, seed: number): number {
-  let h = (Math.imul(x, 374761393) ^ Math.imul(y, 668265263) ^ Math.imul(z, 2246822519) ^ seed) >>> 0;
-  h = (h ^ (h >>> 13)) >>> 0;
-  h = Math.imul(h, 1274126177) >>> 0;
-  h = (h ^ (h >>> 16)) >>> 0;
-  return h / 4294967295;
-}
-
-function valueNoise3D(x: number, y: number, z: number, period: number, seed: number): number {
-  const x0 = Math.floor(x);
-  const y0 = Math.floor(y);
-  const z0 = Math.floor(z);
-  const x1 = x0 + 1;
-  const y1 = y0 + 1;
-  const z1 = z0 + 1;
-  const tx = x - x0;
-  const ty = y - y0;
-  const tz = z - z0;
-  const ux = smoothstep(0, 1, tx);
-  const uy = smoothstep(0, 1, ty);
-  const uz = smoothstep(0, 1, tz);
-
-  const v000 = hash3ToUnit(wrapIndex(x0, period), wrapIndex(y0, period), wrapIndex(z0, period), seed);
-  const v100 = hash3ToUnit(wrapIndex(x1, period), wrapIndex(y0, period), wrapIndex(z0, period), seed);
-  const v010 = hash3ToUnit(wrapIndex(x0, period), wrapIndex(y1, period), wrapIndex(z0, period), seed);
-  const v110 = hash3ToUnit(wrapIndex(x1, period), wrapIndex(y1, period), wrapIndex(z0, period), seed);
-  const v001 = hash3ToUnit(wrapIndex(x0, period), wrapIndex(y0, period), wrapIndex(z1, period), seed);
-  const v101 = hash3ToUnit(wrapIndex(x1, period), wrapIndex(y0, period), wrapIndex(z1, period), seed);
-  const v011 = hash3ToUnit(wrapIndex(x0, period), wrapIndex(y1, period), wrapIndex(z1, period), seed);
-  const v111 = hash3ToUnit(wrapIndex(x1, period), wrapIndex(y1, period), wrapIndex(z1, period), seed);
-
-  const x00 = lerp(v000, v100, ux);
-  const x10 = lerp(v010, v110, ux);
-  const x01 = lerp(v001, v101, ux);
-  const x11 = lerp(v011, v111, ux);
-  const y0v = lerp(x00, x10, uy);
-  const y1v = lerp(x01, x11, uy);
-  return lerp(y0v, y1v, uz);
-}
-
-function fbmTileable(x: number, y: number, z: number, basePeriod: number): number {
-  let sum = 0;
-  let norm = 0;
-  let amplitude = 0.5;
-  for (let octave = 0; octave < 4; octave++) {
-    const frequency = 1 << octave;
-    const period = basePeriod * frequency;
-    sum += amplitude * valueNoise3D(x * frequency, y * frequency, z * frequency, period, 1337 + octave * 911);
-    norm += amplitude;
-    amplitude *= 0.5;
-  }
-  return norm > 0 ? sum / norm : 0;
-}
-
-function worleyF1Tileable(ux: number, uy: number, uz: number, cellCount: number): number {
-  const px = ux * cellCount;
-  const py = uy * cellCount;
-  const pz = uz * cellCount;
-  const baseX = Math.floor(px);
-  const baseY = Math.floor(py);
-  const baseZ = Math.floor(pz);
-  let minDistSq = 1e9;
-
-  for (let dz = -1; dz <= 1; dz++) {
-    for (let dy = -1; dy <= 1; dy++) {
-      for (let dx = -1; dx <= 1; dx++) {
-        const cx = baseX + dx;
-        const cy = baseY + dy;
-        const cz = baseZ + dz;
-        const wx = wrapIndex(cx, cellCount);
-        const wy = wrapIndex(cy, cellCount);
-        const wz = wrapIndex(cz, cellCount);
-        const fx = hash3ToUnit(wx, wy, wz, 401);
-        const fy = hash3ToUnit(wx, wy, wz, 997);
-        const fz = hash3ToUnit(wx, wy, wz, 1597);
-        const sx = cx + fx;
-        const sy = cy + fy;
-        const sz = cz + fz;
-        const dxp = sx - px;
-        const dyp = sy - py;
-        const dzp = sz - pz;
-        const distSq = dxp * dxp + dyp * dyp + dzp * dzp;
-        if (distSq < minDistSq) {
-          minDistSq = distSq;
-        }
-      }
-    }
-  }
-
-  return Math.sqrt(minDistSq);
-}
-
-function createDetailNoiseVolumeData(size: number): Uint8Array<ArrayBuffer> {
-  const voxelCount = size * size * size;
-  const data = new Uint8Array<ArrayBuffer>(new ArrayBuffer(voxelCount * 4));
-  const perlinPeriod = 8;
-  const turbulencePeriod = 14;
-  const worleyCellsCoarse = 7;
-  const worleyCellsFine = 13;
-  let index = 0;
-
-  for (let z = 0; z < size; z++) {
-    const uz = (z + 0.5) / size;
-    for (let y = 0; y < size; y++) {
-      const uy = (y + 0.5) / size;
-      for (let x = 0; x < size; x++) {
-        const ux = (x + 0.5) / size;
-
-        const perlinBase = fbmTileable(ux * perlinPeriod, uy * perlinPeriod, uz * perlinPeriod, perlinPeriod);
-        const perlinShaped = smoothstep(0.20, 0.84, perlinBase);
-
-        const perlinHi = fbmTileable(
-          ux * turbulencePeriod,
-          uy * turbulencePeriod,
-          uz * turbulencePeriod,
-          turbulencePeriod
-        );
-        const turbulence = Math.abs(perlinHi * 2.0 - 1.0);
-        const turbulenceShaped = smoothstep(0.10, 0.95, turbulence);
-
-        const f1Coarse = worleyF1Tileable(ux, uy, uz, worleyCellsCoarse);
-        const worleyCoarse = 1.0 - clamp01(f1Coarse / 1.7320508075688772);
-        const f1Fine = worleyF1Tileable(ux, uy, uz, worleyCellsFine);
-        const worleyFine = 1.0 - clamp01(f1Fine / 1.7320508075688772);
-        const worleyCombined = clamp01(worleyCoarse * 0.62 + worleyFine * 0.38);
-        const worleyShaped = smoothstep(0.05, 0.96, worleyCombined);
-
-        data[index++] = Math.round(clamp01(perlinShaped) * 255);
-        data[index++] = Math.round(clamp01(worleyShaped) * 255);
-        data[index++] = Math.round(clamp01(turbulenceShaped) * 255);
-        data[index++] = 255;
-      }
-    }
-  }
-
-  return data;
-}
-
-function createFillParamsBufferData(enableDetail: boolean): Float32Array<ArrayBuffer> {
+function createReconstructionParamsBufferData(
+  noiseFloor: number,
+  baselineHalfExtents: [number, number, number],
+  baselineSharpness: number
+): Float32Array<ArrayBuffer> {
   const data = new Float32Array<ArrayBuffer>(new ArrayBuffer(8 * 4)); // 2 vec4
-  data[0] = DETAIL_SCALE;
-  data[1] = DETAIL_EROSION_STRENGTH;
-  data[2] = DETAIL_EDGE_START;
-  data[3] = DETAIL_EDGE_END;
-  data[4] = enableDetail ? 1 : 0;
-  data[5] = 0;
-  data[6] = 0;
+  data[0] = baselineHalfExtents[0];
+  data[1] = baselineHalfExtents[1];
+  data[2] = baselineHalfExtents[2];
+  data[3] = 0;
+  data[4] = baselineSharpness;
+  data[5] = noiseFloor;
+  data[6] = RECON_NOISE_KNEE;
   data[7] = 0;
   return data;
 }
@@ -461,10 +330,10 @@ function createFillParamsBufferData(enableDetail: boolean): Float32Array<ArrayBu
 export class WebGPURenderer {
   private renderMode: RenderMode = "cloudSky";
   private sigma = densityControlToSigma(DEFAULT_SIGMA);
+  private reconstructionNoiseFloor = DEFAULT_RECON_NOISE_FLOOR;
   private readonly phaseG = DEFAULT_PHASE_G;
   private readonly sunIntensity = DEFAULT_SUN_INTENSITY;
   private sunDirection = normalize3(0.5, 0.78, 0.37);
-  private detailNoiseEnabled = true;
   private volumeDirty = false;
   private lightingDirty = false;
 
@@ -477,8 +346,8 @@ export class WebGPURenderer {
     private readonly cameraBuffer: GPUBuffer,
     private readonly fillPipeline: GPUComputePipeline,
     private readonly fillBindGroup: GPUBindGroup,
-    private readonly fillParamsBuffer: GPUBuffer,
-    private readonly fillParamsData: Float32Array<ArrayBuffer>,
+    private readonly reconstructionParamsBuffer: GPUBuffer,
+    private readonly reconstructionParamsData: Float32Array<ArrayBuffer>,
     private readonly sunTransmittancePipeline: GPUComputePipeline,
     private readonly sunTransmittanceBindGroup: GPUBindGroup,
     private readonly multiScatterPipeline: GPUComputePipeline,
@@ -604,47 +473,6 @@ export class WebGPURenderer {
       addressModeW: "clamp-to-edge"
     });
 
-    const detailNoiseData = createDetailNoiseVolumeData(DETAIL_TEXTURE_SIZE);
-    const detailNoiseTexture = device.createTexture({
-      size: {
-        width: DETAIL_TEXTURE_SIZE,
-        height: DETAIL_TEXTURE_SIZE,
-        depthOrArrayLayers: DETAIL_TEXTURE_SIZE
-      },
-      dimension: "3d",
-      format: "rgba8unorm",
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
-    });
-    device.queue.writeTexture(
-      { texture: detailNoiseTexture },
-      detailNoiseData,
-      {
-        bytesPerRow: DETAIL_TEXTURE_SIZE * 4,
-        rowsPerImage: DETAIL_TEXTURE_SIZE
-      },
-      {
-        width: DETAIL_TEXTURE_SIZE,
-        height: DETAIL_TEXTURE_SIZE,
-        depthOrArrayLayers: DETAIL_TEXTURE_SIZE
-      }
-    );
-    const detailNoiseView = detailNoiseTexture.createView({ dimension: "3d" });
-    const detailNoiseSampler = device.createSampler({
-      magFilter: "linear",
-      minFilter: "linear",
-      mipmapFilter: "linear",
-      addressModeU: "repeat",
-      addressModeV: "repeat",
-      addressModeW: "repeat"
-    });
-
-    const fillParamsData = createFillParamsBufferData(true);
-    const fillParamsBuffer = device.createBuffer({
-      size: fillParamsData.byteLength,
-      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-    });
-    device.queue.writeBuffer(fillParamsBuffer, 0, fillParamsData);
-
     const lightingStepDistance = 2.0 / VOLUME_SIZE;
     const sunPassParamsData = createLightingParamsBufferData(
       normalize3(0.5, 0.78, 0.37),
@@ -680,6 +508,13 @@ export class WebGPURenderer {
     });
     device.queue.writeBuffer(multiScatterParamsBuffer, 0, multiScatterParamsData);
 
+    const reconstructionParamsData = loadedMlp.fillParamsUniform;
+    const reconstructionParamsBuffer = device.createBuffer({
+      size: reconstructionParamsData.byteLength,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    device.queue.writeBuffer(reconstructionParamsBuffer, 0, reconstructionParamsData);
+
     const fillPipeline = device.createComputePipeline({
       layout: "auto",
       compute: {
@@ -704,15 +539,7 @@ export class WebGPURenderer {
         },
         {
           binding: 3,
-          resource: detailNoiseView
-        },
-        {
-          binding: 4,
-          resource: detailNoiseSampler
-        },
-        {
-          binding: 5,
-          resource: { buffer: fillParamsBuffer }
+          resource: { buffer: reconstructionParamsBuffer }
         }
       ]
     });
@@ -941,8 +768,8 @@ export class WebGPURenderer {
       cameraBuffer,
       fillPipeline,
       fillBindGroup,
-      fillParamsBuffer,
-      fillParamsData,
+      reconstructionParamsBuffer,
+      reconstructionParamsData,
       sunTransmittancePipeline,
       sunTransmittanceBindGroup,
       multiScatterPipeline,
@@ -967,36 +794,17 @@ export class WebGPURenderer {
     this.lightingDirty = true;
   }
 
-  setDetailNoiseEnabled(enabled: boolean): void {
-    const next = Boolean(enabled);
-    if (this.detailNoiseEnabled === next) {
-      return;
-    }
-    this.detailNoiseEnabled = next;
-    this.volumeDirty = true;
-  }
-
-  setDetailScale(value: number): void {
+  setReconstructionNoiseFloor(value: number): void {
     if (!Number.isFinite(value)) {
       return;
     }
-    const next = Math.max(0.25, Math.min(value, 16.0));
-    if (Math.abs(this.fillParamsData[0] - next) < 1e-4) {
+    const next = Math.max(0.0, Math.min(value, 0.35));
+    if (Math.abs(this.reconstructionNoiseFloor - next) < 1e-5) {
       return;
     }
-    this.fillParamsData[0] = next;
-    this.volumeDirty = true;
-  }
-
-  setErosionStrength(value: number): void {
-    if (!Number.isFinite(value)) {
-      return;
-    }
-    const next = Math.max(0.0, Math.min(value, 2.0));
-    if (Math.abs(this.fillParamsData[1] - next) < 1e-4) {
-      return;
-    }
-    this.fillParamsData[1] = next;
+    this.reconstructionNoiseFloor = next;
+    this.reconstructionParamsData[5] = next;
+    this.device.queue.writeBuffer(this.reconstructionParamsBuffer, 0, this.reconstructionParamsData);
     this.volumeDirty = true;
   }
 
@@ -1016,9 +824,6 @@ export class WebGPURenderer {
   }
 
   private updateVolumePrecompute(): void {
-    this.fillParamsData[4] = this.detailNoiseEnabled ? 1 : 0;
-    this.device.queue.writeBuffer(this.fillParamsBuffer, 0, this.fillParamsData);
-
     const fillEncoder = this.device.createCommandEncoder();
     const fillPass = fillEncoder.beginComputePass();
     fillPass.setPipeline(this.fillPipeline);
