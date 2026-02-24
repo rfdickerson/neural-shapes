@@ -40,6 +40,7 @@ class SparseSampleBank:
     density: torch.Tensor  # [N] in [0,1]
     guided_indices: torch.Tensor  # [M] indices with density > importance threshold
     shell_indices: torch.Tensor  # [K] indices near target iso-density shell
+    surface_indices: torch.Tensor  # [S] indices in boundary detail band [surface_min, surface_max]
 
 
 def sdf_torus(
@@ -132,6 +133,8 @@ def load_sparse_samples(
     importance_threshold: float,
     iso_value: float,
     iso_band: float,
+    surface_min: float,
+    surface_max: float,
 ) -> Tuple[SparseSampleBank, Dict[str, Any]]:
     meta_path = samples_meta_path if samples_meta_path is not None else samples_bin_path.with_suffix(".json")
     if not samples_bin_path.exists():
@@ -167,6 +170,8 @@ def load_sparse_samples(
         importance_threshold=importance_threshold,
         iso_value=iso_value,
         iso_band=iso_band,
+        surface_min=surface_min,
+        surface_max=surface_max,
     )
     return bank, meta
 
@@ -177,17 +182,24 @@ def build_sparse_sample_bank(
     importance_threshold: float,
     iso_value: float,
     iso_band: float,
+    surface_min: float,
+    surface_max: float,
 ) -> SparseSampleBank:
     guided_indices = torch.nonzero(density > max(0.0, float(importance_threshold)), as_tuple=False).squeeze(1)
     iso_center = float(max(0.0, min(1.0, iso_value)))
     iso_width = max(1.0e-6, float(iso_band))
     shell_mask = torch.abs(density - iso_center) <= iso_width
     shell_indices = torch.nonzero(shell_mask, as_tuple=False).squeeze(1)
+    smin = float(max(0.0, min(1.0, min(surface_min, surface_max))))
+    smax = float(max(0.0, min(1.0, max(surface_min, surface_max))))
+    surface_mask = (density >= smin) & (density <= smax)
+    surface_indices = torch.nonzero(surface_mask, as_tuple=False).squeeze(1)
     return SparseSampleBank(
         points=points,
         density=density,
         guided_indices=guided_indices.to(torch.long),
         shell_indices=shell_indices.to(torch.long),
+        surface_indices=surface_indices.to(torch.long),
     )
 
 
@@ -198,6 +210,8 @@ def split_sparse_sample_bank(
     importance_threshold: float,
     iso_value: float,
     iso_band: float,
+    surface_min: float,
+    surface_max: float,
 ) -> Tuple[SparseSampleBank, SparseSampleBank | None]:
     ratio = float(max(0.0, min(0.95, val_ratio)))
     count = int(bank.points.shape[0])
@@ -224,6 +238,8 @@ def split_sparse_sample_bank(
         importance_threshold=importance_threshold,
         iso_value=iso_value,
         iso_band=iso_band,
+        surface_min=surface_min,
+        surface_max=surface_max,
     )
     val_bank = build_sparse_sample_bank(
         points=val_points,
@@ -231,6 +247,8 @@ def split_sparse_sample_bank(
         importance_threshold=importance_threshold,
         iso_value=iso_value,
         iso_band=iso_band,
+        surface_min=surface_min,
+        surface_max=surface_max,
     )
     return train_bank, val_bank
 
@@ -337,12 +355,38 @@ def sample_batch(
     importance_oversample: int,
     importance_max_rounds: int,
     iso_shell_ratio: float,
+    surface_band_ratio: float,
     iso_value: float,
     iso_band: float,
+    surface_min: float,
+    surface_max: float,
     residual_representation: str,
     levelset_decode_k: float,
     levelset_density_eps: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def allocate_counts(batch: int, guided_r: float, shell_r: float, surface_r: float) -> Tuple[int, int, int, int]:
+        guided = int(batch * float(max(0.0, min(1.0, guided_r))))
+        shell = int(batch * float(max(0.0, min(1.0, shell_r))))
+        surface = int(batch * float(max(0.0, min(1.0, surface_r))))
+        overflow = guided + shell + surface - batch
+        if overflow > 0:
+            dec = min(guided, overflow)
+            guided -= dec
+            overflow -= dec
+        if overflow > 0:
+            dec = min(shell, overflow)
+            shell -= dec
+            overflow -= dec
+        if overflow > 0:
+            dec = min(surface, overflow)
+            surface -= dec
+            overflow -= dec
+        uniform = batch - guided - shell - surface
+        return uniform, guided, shell, surface
+
+    surface_lo = float(max(0.0, min(1.0, min(surface_min, surface_max))))
+    surface_hi = float(max(0.0, min(1.0, max(surface_min, surface_max))))
+
     if target_source == "torus":
         points = torch.rand(batch_size, 3, device=device) * 2.0 - 1.0
         gt = torus_density(points)
@@ -350,13 +394,12 @@ def sample_batch(
         if target_volume is None:
             raise ValueError("target_volume must be provided when target_source='volume'")
 
-        guided_ratio = float(max(0.0, min(1.0, importance_ratio)))
-        shell_ratio = float(max(0.0, min(1.0, iso_shell_ratio)))
-        shell_count = int(batch_size * shell_ratio)
-        guided_count = int(batch_size * guided_ratio)
-        if shell_count + guided_count > batch_size:
-            guided_count = max(0, batch_size - shell_count)
-        uniform_count = batch_size - guided_count - shell_count
+        uniform_count, guided_count, shell_count, surface_count = allocate_counts(
+            batch_size,
+            importance_ratio,
+            iso_shell_ratio,
+            surface_band_ratio,
+        )
 
         point_chunks: List[torch.Tensor] = []
         if uniform_count > 0:
@@ -415,6 +458,31 @@ def sample_batch(
 
             point_chunks.append(torch.cat(selected_chunks, dim=0))
 
+        if surface_count > 0:
+            selected_chunks = []
+            selected_total = 0
+            rounds = 0
+            oversample = max(1, int(importance_oversample))
+            max_rounds = max(1, int(importance_max_rounds))
+
+            while selected_total < surface_count and rounds < max_rounds:
+                remaining = surface_count - selected_total
+                candidate_count = max(remaining * oversample, oversample)
+                candidates = torch.rand(candidate_count, 3, device=device) * 2.0 - 1.0
+                candidate_gt = sample_volume_trilinear(target_volume, candidates)
+                keep = candidates[(candidate_gt >= surface_lo) & (candidate_gt <= surface_hi)]
+                if keep.shape[0] > 0:
+                    take = min(remaining, keep.shape[0])
+                    selected_chunks.append(keep[:take])
+                    selected_total += take
+                rounds += 1
+
+            if selected_total < surface_count:
+                fill = torch.rand(surface_count - selected_total, 3, device=device) * 2.0 - 1.0
+                selected_chunks.append(fill)
+
+            point_chunks.append(torch.cat(selected_chunks, dim=0))
+
         points = torch.cat(point_chunks, dim=0)
         if points.shape[0] != batch_size:
             raise RuntimeError(f"sampled unexpected point count {points.shape[0]}, expected {batch_size}")
@@ -432,13 +500,12 @@ def sample_batch(
         if sample_count <= 0:
             raise ValueError("sparse samples bank is empty")
 
-        guided_ratio = float(max(0.0, min(1.0, importance_ratio)))
-        shell_ratio = float(max(0.0, min(1.0, iso_shell_ratio)))
-        shell_count = int(batch_size * shell_ratio)
-        guided_count = int(batch_size * guided_ratio)
-        if shell_count + guided_count > batch_size:
-            guided_count = max(0, batch_size - shell_count)
-        uniform_count = batch_size - guided_count - shell_count
+        uniform_count, guided_count, shell_count, surface_count = allocate_counts(
+            batch_size,
+            importance_ratio,
+            iso_shell_ratio,
+            surface_band_ratio,
+        )
 
         point_chunks: List[torch.Tensor] = []
         gt_chunks: List[torch.Tensor] = []
@@ -467,6 +534,16 @@ def sample_batch(
                 idx_shell = torch.randint(0, sample_count, (shell_count,), dtype=torch.long)
             point_chunks.append(bank.points.index_select(0, idx_shell).to(device=device))
             gt_chunks.append(bank.density.index_select(0, idx_shell).to(device=device))
+
+        if surface_count > 0:
+            surface_pool = bank.surface_indices
+            if surface_pool.numel() > 0:
+                pick = torch.randint(0, int(surface_pool.shape[0]), (surface_count,), dtype=torch.long)
+                idx_surface = surface_pool.index_select(0, pick)
+            else:
+                idx_surface = torch.randint(0, sample_count, (surface_count,), dtype=torch.long)
+            point_chunks.append(bank.points.index_select(0, idx_surface).to(device=device))
+            gt_chunks.append(bank.density.index_select(0, idx_surface).to(device=device))
 
         points = torch.cat(point_chunks, dim=0)
         gt = torch.cat(gt_chunks, dim=0)
@@ -711,10 +788,20 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError(f"--loss-ramp-steps must be >= 1, got {args.loss_ramp_steps}")
     if args.iso_shell_ratio < 0 or args.iso_shell_ratio > 1:
         raise ValueError(f"--iso-shell-ratio must be in [0,1], got {args.iso_shell_ratio}")
+    if args.surface_band_ratio < 0 or args.surface_band_ratio > 1:
+        raise ValueError(f"--surface-band-ratio must be in [0,1], got {args.surface_band_ratio}")
     if args.iso_value < 0 or args.iso_value > 1:
         raise ValueError(f"--iso-value must be in [0,1], got {args.iso_value}")
     if args.iso_band <= 0:
         raise ValueError(f"--iso-band must be > 0, got {args.iso_band}")
+    if args.surface_band_min < 0 or args.surface_band_min > 1:
+        raise ValueError(f"--surface-band-min must be in [0,1], got {args.surface_band_min}")
+    if args.surface_band_max < 0 or args.surface_band_max > 1:
+        raise ValueError(f"--surface-band-max must be in [0,1], got {args.surface_band_max}")
+    if args.surface_band_min >= args.surface_band_max:
+        raise ValueError(
+            f"--surface-band-min must be < --surface-band-max, got {args.surface_band_min} >= {args.surface_band_max}"
+        )
     if args.loss_iso_weight < 0:
         raise ValueError(f"--loss-iso-weight must be >= 0, got {args.loss_iso_weight}")
     if args.empty_density_threshold < 0 or args.empty_density_threshold > 1:
@@ -740,8 +827,10 @@ def train(args: argparse.Namespace) -> None:
         f"importance_ratio={args.importance_ratio:.2f}, "
         f"importance_threshold={args.importance_threshold:.3f}, "
         f"iso_shell_ratio={args.iso_shell_ratio:.2f}, "
+        f"surface_band_ratio={args.surface_band_ratio:.2f}, "
         f"iso_value={args.iso_value:.3f}, "
         f"iso_band={args.iso_band:.3f}, "
+        f"surface_band=[{args.surface_band_min:.3f}, {args.surface_band_max:.3f}], "
         f"importance_oversample={args.importance_oversample}, "
         f"importance_max_rounds={args.importance_max_rounds}"
     )
@@ -813,6 +902,8 @@ def train(args: argparse.Namespace) -> None:
             importance_threshold=args.importance_threshold,
             iso_value=args.iso_value,
             iso_band=args.iso_band,
+            surface_min=args.surface_band_min,
+            surface_max=args.surface_band_max,
         )
         sample_min = float(loaded_bank.density.min().item())
         sample_max = float(loaded_bank.density.max().item())
@@ -820,6 +911,7 @@ def train(args: argparse.Namespace) -> None:
         sample_count = int(loaded_bank.points.shape[0])
         guided_count = int(loaded_bank.guided_indices.shape[0])
         shell_count = int(loaded_bank.shell_indices.shape[0])
+        surface_count = int(loaded_bank.surface_indices.shape[0])
         train_sample_bank, eval_sample_bank = split_sparse_sample_bank(
             bank=loaded_bank,
             val_ratio=args.val_ratio,
@@ -827,6 +919,8 @@ def train(args: argparse.Namespace) -> None:
             importance_threshold=args.importance_threshold,
             iso_value=args.iso_value,
             iso_band=args.iso_band,
+            surface_min=args.surface_band_min,
+            surface_max=args.surface_band_max,
         )
         train_count = int(train_sample_bank.points.shape[0])
         if eval_sample_bank is not None:
@@ -839,6 +933,7 @@ def train(args: argparse.Namespace) -> None:
         print(
             f"Target source: samples ({samples_bin_path}), "
             f"count={sample_count}, guided_count={guided_count}, shell_count={shell_count}, "
+            f"surface_count={surface_count}, "
             f"min={sample_min:.6f}, max={sample_max:.6f}, mean={sample_mean:.6f}"
         )
         ground_truth_info = {
@@ -848,6 +943,7 @@ def train(args: argparse.Namespace) -> None:
             "count": sample_count,
             "guided_count": guided_count,
             "shell_count": shell_count,
+            "surface_count": surface_count,
             "train_count": train_count,
             "test_count": int(eval_sample_bank.points.shape[0]) if eval_sample_bank is not None else 0,
             "val_ratio": float(args.val_ratio),
@@ -892,8 +988,11 @@ def train(args: argparse.Namespace) -> None:
             importance_oversample=args.importance_oversample,
             importance_max_rounds=args.importance_max_rounds,
             iso_shell_ratio=args.iso_shell_ratio,
+            surface_band_ratio=args.surface_band_ratio,
             iso_value=args.iso_value,
             iso_band=args.iso_band,
+            surface_min=args.surface_band_min,
+            surface_max=args.surface_band_max,
             residual_representation=args.target_field,
             levelset_decode_k=args.levelset_decode_k,
             levelset_density_eps=args.levelset_density_eps,
@@ -981,8 +1080,11 @@ def train(args: argparse.Namespace) -> None:
                 importance_oversample=args.importance_oversample,
                 importance_max_rounds=args.importance_max_rounds,
                 iso_shell_ratio=args.iso_shell_ratio,
+                surface_band_ratio=args.surface_band_ratio,
                 iso_value=args.iso_value,
                 iso_band=args.iso_band,
+                surface_min=args.surface_band_min,
+                surface_max=args.surface_band_max,
                 residual_representation=args.target_field,
                 levelset_decode_k=args.levelset_decode_k,
                 levelset_density_eps=args.levelset_density_eps,
@@ -1029,6 +1131,9 @@ def train(args: argparse.Namespace) -> None:
         "iso_value": float(args.iso_value),
         "iso_band": float(args.iso_band),
         "iso_shell_ratio": float(args.iso_shell_ratio),
+        "surface_band_ratio": float(args.surface_band_ratio),
+        "surface_band_min": float(args.surface_band_min),
+        "surface_band_max": float(args.surface_band_max),
         "iso_loss_weight": float(args.loss_iso_weight),
         "empty_density_threshold": float(args.empty_density_threshold),
         "empty_space_loss_weight": float(args.loss_empty_space_weight),
@@ -1236,6 +1341,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Fraction of each batch sampled from iso-density shell candidates.",
     )
     p.add_argument(
+        "--surface-band-ratio",
+        type=float,
+        default=0.55,
+        help="Fraction of each batch sampled from surface-detail density band [surface-band-min, surface-band-max].",
+    )
+    p.add_argument(
         "--iso-value",
         type=float,
         default=0.10,
@@ -1246,6 +1357,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.05,
         help="Half-width of iso shell for boundary-focused sampling/loss.",
+    )
+    p.add_argument(
+        "--surface-band-min",
+        type=float,
+        default=0.05,
+        help="Lower density bound for surface-band oversampling.",
+    )
+    p.add_argument(
+        "--surface-band-max",
+        type=float,
+        default=0.30,
+        help="Upper density bound for surface-band oversampling.",
     )
     p.add_argument(
         "--val-ratio",

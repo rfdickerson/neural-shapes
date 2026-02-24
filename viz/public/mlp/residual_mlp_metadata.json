@@ -45,6 +45,7 @@
     "count": 4000000,
     "guided_count": 868417,
     "shell_count": 31614,
+    "surface_count": 69052,
     "train_count": 3600000,
     "test_count": 400000,
     "val_ratio": 0.1,
@@ -91,6 +92,9 @@
       "iso_value": 0.1,
       "iso_band": 0.05,
       "iso_shell_ratio": 0.35,
+      "surface_band_ratio": 0.55,
+      "surface_band_min": 0.05,
+      "surface_band_max": 0.3,
       "iso_loss_weight": 3.0,
       "empty_density_threshold": 0.02,
       "empty_space_loss_weight": 1.0
