@@ -47,7 +47,8 @@ fn csMain(@builtin(global_invocation_id) id: vec3u) {
   let sunRadiance = dynamicSun * sunIntensity * extinction;
 
   let sigmaT = density * densityScale * extinctionCoeff;
-  let source = sigmaT * sunTr * sunRadiance * (1.0 / (4.0 * kPi));
+  let sigmaS = sigmaT * albedo;
+  let source = sigmaS * sunTr * sunRadiance * (1.0 / (4.0 * kPi));
 
   let d = vec3i(dim);
   let p = vec3i(id);
@@ -62,12 +63,13 @@ fn csMain(@builtin(global_invocation_id) id: vec3u) {
     let msZp = sampleMs(p + vec3i(0, 0, 1), d);
     let msZn = sampleMs(p + vec3i(0, 0, -1), d);
 
-    let wXp = 0.5 - 0.5 * sunDir.x;
-    let wXn = 0.5 + 0.5 * sunDir.x;
-    let wYp = 0.5 - 0.5 * sunDir.y;
-    let wYn = 0.5 + 0.5 * sunDir.y;
-    let wZp = 0.5 - 0.5 * sunDir.z;
-    let wZn = 0.5 + 0.5 * sunDir.z;
+    let bias = 0.25;
+    let wXp = 0.5 - bias * sunDir.x;
+    let wXn = 0.5 + bias * sunDir.x;
+    let wYp = 0.5 - bias * sunDir.y;
+    let wYn = 0.5 + bias * sunDir.y;
+    let wZp = 0.5 - bias * sunDir.z;
+    let wZn = 0.5 + bias * sunDir.z;
 
     var blur = (msXp * wXp + msXn * wXn) + (msYp * wYp + msYn * wYn) + (msZp * wZp + msZn * wZn);
     blur *= (1.0 / 3.0);
@@ -75,8 +77,7 @@ fn csMain(@builtin(global_invocation_id) id: vec3u) {
   }
 
   let transmission = exp(-sigmaT * stepDistance);
-  let scatteringFraction = (1.0 - transmission) * albedo;
-  let outE = max(source + (propagated * scatteringFraction), vec3f(0.0));
+  let outE = max(source + (propagated * transmission), vec3f(0.0));
 
   textureStore(multiScatterOut, p, vec4f(outE, 1.0));
 }
