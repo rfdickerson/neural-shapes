@@ -8,6 +8,7 @@ struct LightingParams {
 }
 
 @group(0) @binding(0) var densityVolume: texture_3d<f32>;
+@group(0) @binding(1) var densitySampler: sampler;
 @group(0) @binding(2) var sunTransmittanceOut: texture_storage_3d<rgba16float, write>;
 @group(0) @binding(3) var<uniform> params: LightingParams;
 
@@ -28,13 +29,12 @@ fn sampleDensity(p: vec3f) -> f32 {
   if (any(uvw < vec3f(0.0)) || any(uvw > vec3f(1.0))) {
     return 0.0;
   }
-  let dims = textureDimensions(densityVolume, 0);
-  let coord = min(vec3u(uvw * vec3f(dims)), dims - vec3u(1u));
-  return clamp(textureLoad(densityVolume, vec3i(coord), 0).r, 0.0, 1.0);
+  return clamp(textureSampleLevel(densityVolume, densitySampler, uvw, 0.0).r, 0.0, 1.0);
 }
 
 fn intersectAabb(rayOrigin: vec3f, rayDir: vec3f, bmin: vec3f, bmax: vec3f) -> vec2f {
-  let invDir = 1.0 / rayDir;
+  let dirSign = select(vec3f(1.0), vec3f(-1.0), rayDir < vec3f(0.0));
+  let invDir = dirSign / max(abs(rayDir), vec3f(1e-6));
   let t0 = (bmin - rayOrigin) * invDir;
   let t1 = (bmax - rayOrigin) * invDir;
   let tSmall = min(t0, t1);
@@ -55,14 +55,18 @@ fn csMain(@builtin(global_invocation_id) id: vec3u) {
   let p = mix(kCloudAabbMin, kCloudAabbMax, uvw);
   let sunDir = normalize(params.sunDirectionIntensity.xyz);
 
-  let hit = intersectAabb(p + sunDir * 0.01, sunDir, kCloudAabbMin, kCloudAabbMax);
+  let rayOrigin = p + sunDir * 0.01;
+  let hit = intersectAabb(rayOrigin, sunDir, kCloudAabbMin, kCloudAabbMax);
   if (hit.y <= hit.x) {
     textureStore(sunTransmittanceOut, vec3i(id), vec4f(1.0, 0.0, 0.0, 1.0));
     return;
   }
 
-  let steps = u32(max(params.solveParams.w, 1.0));
   let segmentLen = hit.y - hit.x;
+  let desiredStep = max(params.solveParams.z, 1e-4);
+  let maxSteps = u32(max(params.solveParams.w, 1.0));
+  let stepsF = ceil(segmentLen / desiredStep);
+  let steps = u32(clamp(stepsF, 1.0, f32(maxSteps)));
   let stepSize = segmentLen / f32(max(steps, 1u));
   if (stepSize <= 0.0) {
     textureStore(sunTransmittanceOut, vec3i(id), vec4f(1.0, 0.0, 0.0, 1.0));
@@ -74,12 +78,15 @@ fn csMain(@builtin(global_invocation_id) id: vec3u) {
   let jitter = f32(hash3(id)) * (1.0 / 4294967295.0);
 
   var opticalDepth = 0.0;
-  var t = hit.x + fract(jitter + 0.5) * stepSize;
+  var t = hit.x + jitter * stepSize;
   for (var i = 0u; i < steps; i++) {
-    let x = p + sunDir * t;
+    if (t > hit.y) {
+      break;
+    }
+    let x = rayOrigin + sunDir * t;
     let sigmaT = sampleDensity(x) * densityScale * extinctionCoeff;
     opticalDepth += sigmaT * stepSize;
-    if (opticalDepth > 12.0) {
+    if (opticalDepth > 8.0) {
       break;
     }
     t += stepSize;

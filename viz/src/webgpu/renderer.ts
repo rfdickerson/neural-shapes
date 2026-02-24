@@ -19,10 +19,10 @@ const LIGHT_MARCH_STEPS = 96;
 const MULTISCATTER_ITERS = 8;
 const MULTISCATTER_LAMBDA = 0.58;
 const DETAIL_TEXTURE_SIZE = 64;
-const DETAIL_SCALE = 3.25;
-const DETAIL_EROSION_STRENGTH = 0.32;
-const DETAIL_EDGE_START = 0.08;
-const DETAIL_EDGE_END = 0.58;
+const DETAIL_SCALE = 4.6;
+const DETAIL_EROSION_STRENGTH = 0.48;
+const DETAIL_EDGE_START = 0.05;
+const DETAIL_EDGE_END = 0.66;
 
 export type RenderMode = "cloudSky" | "fogOnly";
 
@@ -296,6 +296,12 @@ function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
 
+function densityControlToSigma(value: number): number {
+  // Nonlinear remap so UI density values produce stronger extinction in-cloud.
+  const d = Math.max(0.2, Math.min(value, 12.0));
+  return d * (1.25 + 0.22 * d);
+}
+
 function wrapIndex(value: number, size: number): number {
   const r = value % size;
   return r < 0 ? r + size : r;
@@ -397,7 +403,9 @@ function createDetailNoiseVolumeData(size: number): Uint8Array<ArrayBuffer> {
   const voxelCount = size * size * size;
   const data = new Uint8Array<ArrayBuffer>(new ArrayBuffer(voxelCount * 4));
   const perlinPeriod = 8;
-  const worleyCells = 7;
+  const turbulencePeriod = 14;
+  const worleyCellsCoarse = 7;
+  const worleyCellsFine = 13;
   let index = 0;
 
   for (let z = 0; z < size; z++) {
@@ -407,16 +415,28 @@ function createDetailNoiseVolumeData(size: number): Uint8Array<ArrayBuffer> {
       for (let x = 0; x < size; x++) {
         const ux = (x + 0.5) / size;
 
-        const perlin = fbmTileable(ux * perlinPeriod, uy * perlinPeriod, uz * perlinPeriod, perlinPeriod);
-        const perlinShaped = smoothstep(0.22, 0.82, perlin);
+        const perlinBase = fbmTileable(ux * perlinPeriod, uy * perlinPeriod, uz * perlinPeriod, perlinPeriod);
+        const perlinShaped = smoothstep(0.20, 0.84, perlinBase);
 
-        const f1 = worleyF1Tileable(ux, uy, uz, worleyCells);
-        const worley = 1.0 - clamp01(f1 / 1.7320508075688772);
-        const worleyShaped = smoothstep(0.08, 0.92, worley);
+        const perlinHi = fbmTileable(
+          ux * turbulencePeriod,
+          uy * turbulencePeriod,
+          uz * turbulencePeriod,
+          turbulencePeriod
+        );
+        const turbulence = Math.abs(perlinHi * 2.0 - 1.0);
+        const turbulenceShaped = smoothstep(0.10, 0.95, turbulence);
+
+        const f1Coarse = worleyF1Tileable(ux, uy, uz, worleyCellsCoarse);
+        const worleyCoarse = 1.0 - clamp01(f1Coarse / 1.7320508075688772);
+        const f1Fine = worleyF1Tileable(ux, uy, uz, worleyCellsFine);
+        const worleyFine = 1.0 - clamp01(f1Fine / 1.7320508075688772);
+        const worleyCombined = clamp01(worleyCoarse * 0.62 + worleyFine * 0.38);
+        const worleyShaped = smoothstep(0.05, 0.96, worleyCombined);
 
         data[index++] = Math.round(clamp01(perlinShaped) * 255);
         data[index++] = Math.round(clamp01(worleyShaped) * 255);
-        data[index++] = 0;
+        data[index++] = Math.round(clamp01(turbulenceShaped) * 255);
         data[index++] = 255;
       }
     }
@@ -440,7 +460,7 @@ function createFillParamsBufferData(enableDetail: boolean): Float32Array<ArrayBu
 
 export class WebGPURenderer {
   private renderMode: RenderMode = "cloudSky";
-  private sigma = DEFAULT_SIGMA;
+  private sigma = densityControlToSigma(DEFAULT_SIGMA);
   private readonly phaseG = DEFAULT_PHASE_G;
   private readonly sunIntensity = DEFAULT_SUN_INTENSITY;
   private sunDirection = normalize3(0.5, 0.78, 0.37);
@@ -629,7 +649,7 @@ export class WebGPURenderer {
     const sunPassParamsData = createLightingParamsBufferData(
       normalize3(0.5, 0.78, 0.37),
       DEFAULT_SUN_INTENSITY,
-      DEFAULT_SIGMA,
+      densityControlToSigma(DEFAULT_SIGMA),
       DEFAULT_PHASE_G,
       DEFAULT_ALBEDO,
       VOLUME_SIZE,
@@ -646,7 +666,7 @@ export class WebGPURenderer {
     const multiScatterParamsData = createLightingParamsBufferData(
       normalize3(0.5, 0.78, 0.37),
       DEFAULT_SUN_INTENSITY,
-      DEFAULT_SIGMA,
+      densityControlToSigma(DEFAULT_SIGMA),
       DEFAULT_PHASE_G,
       DEFAULT_ALBEDO,
       VOLUME_SIZE,
@@ -710,6 +730,10 @@ export class WebGPURenderer {
         {
           binding: 0,
           resource: volumeView
+        },
+        {
+          binding: 1,
+          resource: volumeSampler
         },
         {
           binding: 2,
@@ -939,7 +963,7 @@ export class WebGPURenderer {
     if (!Number.isFinite(value)) {
       return;
     }
-    this.sigma = Math.max(0.01, Math.min(value, 12.0));
+    this.sigma = densityControlToSigma(value);
     this.lightingDirty = true;
   }
 
@@ -949,6 +973,30 @@ export class WebGPURenderer {
       return;
     }
     this.detailNoiseEnabled = next;
+    this.volumeDirty = true;
+  }
+
+  setDetailScale(value: number): void {
+    if (!Number.isFinite(value)) {
+      return;
+    }
+    const next = Math.max(0.25, Math.min(value, 16.0));
+    if (Math.abs(this.fillParamsData[0] - next) < 1e-4) {
+      return;
+    }
+    this.fillParamsData[0] = next;
+    this.volumeDirty = true;
+  }
+
+  setErosionStrength(value: number): void {
+    if (!Number.isFinite(value)) {
+      return;
+    }
+    const next = Math.max(0.0, Math.min(value, 2.0));
+    if (Math.abs(this.fillParamsData[1] - next) < 1e-4) {
+      return;
+    }
+    this.fillParamsData[1] = next;
     this.volumeDirty = true;
   }
 

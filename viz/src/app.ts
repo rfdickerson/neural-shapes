@@ -3,11 +3,17 @@ import { WebGPURenderer, type RenderMode } from "./webgpu/renderer";
 
 const DEFAULT_SUN_PITCH = 51;
 const DEFAULT_SUN_AZIMUTH = 36;
+const DEFAULT_DETAIL_SCALE = 4.6;
+const DEFAULT_EROSION_STRENGTH = 0.48;
 
 export class App {
   private readonly canvas: HTMLCanvasElement;
   private readonly modeSelect: HTMLSelectElement;
   private readonly detailNoiseToggle: HTMLInputElement;
+  private readonly detailScaleSlider: HTMLInputElement;
+  private readonly detailScaleValue: HTMLSpanElement;
+  private readonly erosionStrengthSlider: HTMLInputElement;
+  private readonly erosionStrengthValue: HTMLSpanElement;
   private readonly densitySlider: HTMLInputElement;
   private readonly densityValue: HTMLSpanElement;
   private readonly sunPitchSlider: HTMLInputElement;
@@ -61,6 +67,56 @@ export class App {
     detailRow.append(detailLabel, this.detailNoiseToggle);
     cloudPanel.appendChild(detailRow);
 
+    const detailScaleLabel = document.createElement("label");
+    detailScaleLabel.className = "controls__label";
+    detailScaleLabel.htmlFor = "detail-scale-slider";
+    detailScaleLabel.textContent = "Detail Scale";
+
+    this.detailScaleSlider = document.createElement("input");
+    this.detailScaleSlider.id = "detail-scale-slider";
+    this.detailScaleSlider.className = "controls__range";
+    this.detailScaleSlider.type = "range";
+    this.detailScaleSlider.min = "0.5";
+    this.detailScaleSlider.max = "10.0";
+    this.detailScaleSlider.step = "0.05";
+    this.detailScaleSlider.value = DEFAULT_DETAIL_SCALE.toFixed(2);
+
+    this.detailScaleValue = document.createElement("span");
+    this.detailScaleValue.className = "controls__value";
+    this.detailScaleValue.textContent = Number(this.detailScaleSlider.value).toFixed(2);
+    const detailScaleField = document.createElement("div");
+    detailScaleField.className = "controls__field";
+    detailScaleField.append(this.detailScaleSlider, this.detailScaleValue);
+    const detailScaleRow = document.createElement("div");
+    detailScaleRow.className = "controls__row";
+    detailScaleRow.append(detailScaleLabel, detailScaleField);
+    cloudPanel.appendChild(detailScaleRow);
+
+    const erosionStrengthLabel = document.createElement("label");
+    erosionStrengthLabel.className = "controls__label";
+    erosionStrengthLabel.htmlFor = "erosion-strength-slider";
+    erosionStrengthLabel.textContent = "Erosion Strength";
+
+    this.erosionStrengthSlider = document.createElement("input");
+    this.erosionStrengthSlider.id = "erosion-strength-slider";
+    this.erosionStrengthSlider.className = "controls__range";
+    this.erosionStrengthSlider.type = "range";
+    this.erosionStrengthSlider.min = "0.0";
+    this.erosionStrengthSlider.max = "1.5";
+    this.erosionStrengthSlider.step = "0.02";
+    this.erosionStrengthSlider.value = DEFAULT_EROSION_STRENGTH.toFixed(2);
+
+    this.erosionStrengthValue = document.createElement("span");
+    this.erosionStrengthValue.className = "controls__value";
+    this.erosionStrengthValue.textContent = Number(this.erosionStrengthSlider.value).toFixed(2);
+    const erosionStrengthField = document.createElement("div");
+    erosionStrengthField.className = "controls__field";
+    erosionStrengthField.append(this.erosionStrengthSlider, this.erosionStrengthValue);
+    const erosionStrengthRow = document.createElement("div");
+    erosionStrengthRow.className = "controls__row";
+    erosionStrengthRow.append(erosionStrengthLabel, erosionStrengthField);
+    cloudPanel.appendChild(erosionStrengthRow);
+
     const densityLabel = document.createElement("label");
     densityLabel.className = "controls__label";
     densityLabel.htmlFor = "density-slider";
@@ -71,7 +127,7 @@ export class App {
     this.densitySlider.className = "controls__range";
     this.densitySlider.type = "range";
     this.densitySlider.min = "0.2";
-    this.densitySlider.max = "8.0";
+    this.densitySlider.max = "12.0";
     this.densitySlider.step = "0.05";
     this.densitySlider.value = "4.0";
 
@@ -161,6 +217,18 @@ export class App {
       this.renderer?.setDetailNoiseEnabled(this.detailNoiseToggle.checked);
     });
 
+    this.detailScaleSlider.addEventListener("input", () => {
+      const value = Number(this.detailScaleSlider.value);
+      this.detailScaleValue.textContent = value.toFixed(2);
+      this.renderer?.setDetailScale(value);
+    });
+
+    this.erosionStrengthSlider.addEventListener("input", () => {
+      const value = Number(this.erosionStrengthSlider.value);
+      this.erosionStrengthValue.textContent = value.toFixed(2);
+      this.renderer?.setErosionStrength(value);
+    });
+
     this.densitySlider.addEventListener("input", () => {
       const value = Number(this.densitySlider.value);
       this.densityValue.textContent = value.toFixed(2);
@@ -184,6 +252,8 @@ export class App {
     this.renderer = await WebGPURenderer.create(this.canvas);
     this.renderer.setRenderMode(this.modeSelect.value as RenderMode);
     this.renderer.setDetailNoiseEnabled(this.detailNoiseToggle.checked);
+    this.renderer.setDetailScale(Number(this.detailScaleSlider.value));
+    this.renderer.setErosionStrength(Number(this.erosionStrengthSlider.value));
     this.renderer.setCloudDensity(Number(this.densitySlider.value));
     this.renderer.setSunAngles(Number(this.sunPitchSlider.value), Number(this.sunAzimuthSlider.value));
     window.addEventListener("resize", this.handleResize);

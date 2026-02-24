@@ -4,7 +4,7 @@ const ENCODED_DIM = 27u;
 const MAX_HIDDEN = 128u;
 const BOX_HALF_EXTENTS = vec3<f32>(0.6, 0.25, 0.6);
 const BOX_SHARPNESS = 14.0;
-const DENSITY_WRITE_CUTOFF = 0.14;
+const DENSITY_WRITE_CUTOFF = 0.18;
 
 struct MLPMetadata {
   inputDim: u32,
@@ -156,14 +156,42 @@ fn erodeWithDetail(rawDensity: f32, p: vec3<f32>) -> f32 {
   let edgeEnd = clamp(fillParams.detailParams.w, edgeStart + 1.0e-4, 1.0);
 
   let uvw = fract((p * 0.5 + vec3<f32>(0.5)) * detailScale);
-  let noise = textureSampleLevel(detailNoiseTex, detailNoiseSampler, uvw, 0.0);
-  let perlin = noise.r;
-  let worley = noise.g;
-  // Erode mostly near cloud boundaries, not dense core.
-  let edgeMask = 1.0 - smoothstep(edgeStart, edgeEnd, rawDensity);
-  let erosionNoise = mix(perlin, worley, 0.65);
-  let erosion = (1.0 - erosionNoise) * erosionStrength * edgeMask;
-  return max(rawDensity - erosion, 0.0);
+  let edgeMask = pow(1.0 - smoothstep(edgeStart, edgeEnd, rawDensity), 1.45);
+
+  // Domain-warp detail coordinates near edges so breakup does not read as uniform lumps.
+  let baseNoise = textureSampleLevel(detailNoiseTex, detailNoiseSampler, uvw, 0.0);
+  let warp = (baseNoise.rgb * 2.0 - vec3<f32>(1.0)) * (0.11 * edgeMask);
+  let warpedUvw = fract(uvw + warp);
+
+  let noise0 = textureSampleLevel(detailNoiseTex, detailNoiseSampler, warpedUvw, 0.0);
+  let noise1 = textureSampleLevel(
+    detailNoiseTex,
+    detailNoiseSampler,
+    fract(warpedUvw * 2.07 + vec3<f32>(0.17, 0.31, 0.47)),
+    0.0
+  );
+  let noise2 = textureSampleLevel(
+    detailNoiseTex,
+    detailNoiseSampler,
+    fract(warpedUvw * 4.19 + vec3<f32>(0.43, 0.13, 0.73)),
+    0.0
+  );
+
+  let worley = clamp(noise0.g * 0.55 + noise1.g * 0.30 + noise2.g * 0.15, 0.0, 1.0);
+  let turbulence = clamp(noise1.b * 0.65 + noise2.b * 0.35, 0.0, 1.0);
+  let perlin = noise0.r;
+
+  // Modulate edge threshold with detail (signed) rather than pure subtraction.
+  let cauliflowerNoise = clamp((worley * 0.72) + ((1.0 - turbulence) * 0.20) + (perlin * 0.08), 0.0, 1.0);
+  let detailSigned = (cauliflowerNoise - 0.5) * 2.0;
+  let thresholdShift = detailSigned * erosionStrength * edgeMask * 0.22;
+  let shiftedDensity = clamp(rawDensity + thresholdShift, 0.0, 1.0);
+
+  // High-contrast cellular carving concentrated at boundaries.
+  let carveMask = smoothstep(0.34, 0.76, cauliflowerNoise);
+  let carveAmount = edgeMask * erosionStrength * 0.85;
+  let carvedDensity = shiftedDensity * mix(1.0, carveMask, carveAmount);
+  return clamp(carvedDensity, 0.0, 1.0);
 }
 
 @compute @workgroup_size(4, 4, 4)
@@ -180,7 +208,8 @@ fn csMain(@builtin(global_invocation_id) id: vec3<u32>) {
   let residual = mlpResidual(p); // keep signed so negative values can carve holes
   let baseDensity = clamp(macroDensity + residual, 0.0, 1.0);
   let detailedDensity = erodeWithDetail(baseDensity, p);
-  let density = select(0.0, detailedDensity, detailedDensity >= DENSITY_WRITE_CUTOFF);
+  let shapedDensity = pow(detailedDensity, 0.82);
+  let density = select(0.0, shapedDensity, shapedDensity >= DENSITY_WRITE_CUTOFF);
 
   textureStore(volumeOut, vec3<i32>(id), vec4f(density, 0.0, 0.0, 0.0));
 }

@@ -73,7 +73,8 @@ fn estimateNormal(p: vec3f, epsScalar: f32) -> vec3f {
 }
 
 fn intersectAabb(rayOrigin: vec3f, rayDir: vec3f, bmin: vec3f, bmax: vec3f) -> vec2f {
-  let invDir = 1.0 / rayDir;
+  let dirSign = select(vec3f(1.0), vec3f(-1.0), rayDir < vec3f(0.0));
+  let invDir = dirSign / max(abs(rayDir), vec3f(1e-6));
   let t0 = (bmin - rayOrigin) * invDir;
   let t1 = (bmax - rayOrigin) * invDir;
   let tsmaller = min(t0, t1);
