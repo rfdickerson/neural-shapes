@@ -40,9 +40,7 @@ fn density(p: vec3f) -> f32 {
   if (any(uvw < vec3f(0.0)) || any(uvw > vec3f(1.0))) {
     return 0.0;
   }
-  let dims = textureDimensions(volumeTex, 0);
-  let coord = min(vec3u(uvw * vec3f(dims)), dims - vec3u(1u));
-  return clamp(textureLoad(volumeTex, vec3i(coord), 0).r, 0.0, 1.0);
+  return clamp(textureSampleLevel(volumeTex, volumeSampler, uvw, 0.0).r, 0.0, 1.0);
 }
 
 fn sampleSunTransmittance(p: vec3f) -> f32 {
@@ -133,8 +131,13 @@ fn skyColor(dir: vec3f, sunDir: vec3f, sunIntensity: f32) -> vec3f {
   return mix(nightSky, sky, daylight);
 }
 
-fn toneMap(color: vec3f) -> vec3f {
-  return color / (vec3f(1.0) + color);
+fn toneMapACES(x: vec3f) -> vec3f {
+  let a = 2.51;
+  let b = 0.03;
+  let c = 2.43;
+  let d = 0.59;
+  let e = 0.14;
+  return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3f(0.0), vec3f(1.0));
 }
 
 @fragment
@@ -167,7 +170,7 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
   let tEnd = min(farT, hit.y);
   if (tEnd <= tStart) {
     if (modeFlag > 0.5) {
-      return vec4f(clamp(toneMap(skyColor(rayDir, sunDir, sunIntensity)), vec3f(0.0), vec3f(1.0)), 1.0);
+      return vec4f(toneMapACES(skyColor(rayDir, sunDir, sunIntensity)), 1.0);
     }
     return vec4f(0.0, 0.0, 0.0, 1.0);
   }
@@ -181,7 +184,9 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
   let jitterFactor = hash(in.uv);
   let sunset = 1.0 - smoothstep(0.02, 0.55, sunDir.y);
   let autoPhaseG = clamp(mix(basePhaseG, min(basePhaseG + 0.08, 0.84), sunset), 0.0, 0.90);
-  let sunPhase = henyeyGreenstein(clamp(dot(rayDir, sunDir), -1.0, 1.0), autoPhaseG);
+  let sunViewCos = clamp(dot(rayDir, sunDir), -1.0, 1.0);
+  let sunPhase = 1.5 * henyeyGreenstein(sunViewCos, autoPhaseG);
+  let forwardScatterBoost = pow(max(sunViewCos, 0.0), 4.0);
   let sunColor = mix(vec3f(1.0, 0.97, 0.92), vec3f(1.35, 0.58, 0.25), sunset);
   let sunRadiance = sunColor * sunIntensity;
   let cloudAlbedo = 0.92;
@@ -197,7 +202,7 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
     let p = camPos + rayDir * t;
     let d = density(p);
     let densityMask = smoothstep(0.02, 0.24, d);
-    let localStep = mix(stepSize * 1.35, stepSize * 0.55, densityMask);
+    let localStep = mix(stepSize * 2.0, stepSize * 0.4, densityMask);
     if (d <= 1e-4) {
       t += localStep;
       continue;
@@ -212,9 +217,9 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
       let viewFacing = max(dot(n, -rayDir), 0.0);
       let rim = pow(1.0 - viewFacing, 2.0);
 
-      let direct = sunRadiance * sunPhase * sunTr * cloudAlbedo * (0.70 + 0.30 * ndotl);
-      let indirect = sampleMultiScatter(p) * 0.45;
-      let edgeAccent = 1.0 + rim * 0.25;
+      let direct = sunRadiance * sunPhase * sunTr * cloudAlbedo * (0.90 + 0.10 * ndotl);
+      let indirect = sampleMultiScatter(p) * d * 0.8;
+      let edgeAccent = 1.0 + rim * 0.4 + forwardScatterBoost * 0.6;
       let scattering = ambientTerm * 0.88 + direct + indirect;
       cloudAccum += scattering * contrib * edgeAccent;
     } else {
@@ -227,8 +232,8 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
   if (modeFlag > 0.5) {
     let backgroundSky = skyColor(rayDir, sunDir, sunIntensity);
     let finalCloud = cloudAccum + backgroundSky * transmittance;
-    let mapped = toneMap(finalCloud);
-    return vec4f(clamp(mapped, vec3f(0.0), vec3f(1.0)), 1.0);
+    let mapped = toneMapACES(finalCloud);
+    return vec4f(mapped, 1.0);
   }
 
   let gray = clamp(accum, 0.0, 1.0);
