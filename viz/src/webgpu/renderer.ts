@@ -1,14 +1,25 @@
 import shaderSource from "./shaders/raymarch.wgsl?raw";
 import fillVolumeSource from "./shaders/fillVolume.wgsl?raw";
+import sunTransmittanceSource from "./shaders/sunTransmittance.wgsl?raw";
+import multiScatterSource from "./shaders/multiScatter.wgsl?raw";
 import type { OrbitCamera } from "./orbitCamera";
 
-const CAMERA_UNIFORM_BYTES = 64;
+const CAMERA_UNIFORM_BYTES = 96;
 const VOLUME_SIZE = 64;
 const SHADER_MAX_INPUT_DIM = 27;
 const SHADER_MAX_HIDDEN = 64;
 const MLP_META_URL = "/mlp/residual_mlp_metadata.json";
 const MLP_WEIGHTS_URL = "/mlp/residual_mlp_weights.bin";
 const EXPECTED_ENCODING_ORDER = "input_xyz_then_per_level_sin_xyz_cos_xyz";
+const DEFAULT_SIGMA = 4.0;
+const DEFAULT_PHASE_G = 0.72;
+const DEFAULT_SUN_INTENSITY = 2.4;
+const DEFAULT_ALBEDO = 0.92;
+const LIGHT_MARCH_STEPS = 96;
+const MULTISCATTER_ITERS = 8;
+const MULTISCATTER_LAMBDA = 0.58;
+
+export type RenderMode = "cloudSky" | "fogOnly";
 
 interface ExportMetadata {
   layout: string;
@@ -227,7 +238,45 @@ function validateLoadedModel(metaUniform: Uint32Array<ArrayBuffer>): void {
   }
 }
 
+function normalize3(x: number, y: number, z: number): [number, number, number] {
+  const len = Math.hypot(x, y, z) || 1;
+  return [x / len, y / len, z / len];
+}
+
+function createLightingParamsBufferData(
+  sunDirection: [number, number, number],
+  sunIntensity: number,
+  sigma: number,
+  phaseG: number,
+  albedo: number,
+  solveDim: number,
+  lambda: number,
+  stepDistance: number,
+  solveW: number
+): Float32Array<ArrayBuffer> {
+  const data = new Float32Array<ArrayBuffer>(new ArrayBuffer(12 * 4)); // 3 vec4
+  data[0] = sunDirection[0];
+  data[1] = sunDirection[1];
+  data[2] = sunDirection[2];
+  data[3] = sunIntensity;
+  data[4] = 1.0; // density scale
+  data[5] = phaseG;
+  data[6] = albedo;
+  data[7] = sigma; // extinction coefficient
+  data[8] = solveDim;
+  data[9] = lambda;
+  data[10] = stepDistance;
+  data[11] = solveW; // reused as march steps or iteration index depending on pass
+  return data;
+}
+
 export class WebGPURenderer {
+  private renderMode: RenderMode = "cloudSky";
+  private sigma = DEFAULT_SIGMA;
+  private readonly phaseG = DEFAULT_PHASE_G;
+  private readonly sunIntensity = DEFAULT_SUN_INTENSITY;
+  private readonly sunDirection = normalize3(0.5, 0.78, 0.37);
+
   private constructor(
     private readonly device: GPUDevice,
     private readonly context: GPUCanvasContext,
@@ -268,6 +317,12 @@ export class WebGPURenderer {
     const fillVolumeShader = device.createShaderModule({
       code: fillVolumeSource
     });
+    const sunTransmittanceShader = device.createShaderModule({
+      code: sunTransmittanceSource
+    });
+    const multiScatterShader = device.createShaderModule({
+      code: multiScatterSource
+    });
 
     const cameraBuffer = device.createBuffer({
       size: CAMERA_UNIFORM_BYTES,
@@ -289,6 +344,41 @@ export class WebGPURenderer {
     });
     const volumeView = volumeTexture.createView({ dimension: "3d" });
 
+    const sunTransmittanceTexture = device.createTexture({
+      size: {
+        width: VOLUME_SIZE,
+        height: VOLUME_SIZE,
+        depthOrArrayLayers: VOLUME_SIZE
+      },
+      dimension: "3d",
+      format: "rgba16float",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING
+    });
+    const sunTransmittanceView = sunTransmittanceTexture.createView({ dimension: "3d" });
+
+    const multiScatterTextureA = device.createTexture({
+      size: {
+        width: VOLUME_SIZE,
+        height: VOLUME_SIZE,
+        depthOrArrayLayers: VOLUME_SIZE
+      },
+      dimension: "3d",
+      format: "rgba16float",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING
+    });
+    const multiScatterTextureB = device.createTexture({
+      size: {
+        width: VOLUME_SIZE,
+        height: VOLUME_SIZE,
+        depthOrArrayLayers: VOLUME_SIZE
+      },
+      dimension: "3d",
+      format: "rgba16float",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING
+    });
+    const multiScatterViewA = multiScatterTextureA.createView({ dimension: "3d" });
+    const multiScatterViewB = multiScatterTextureB.createView({ dimension: "3d" });
+
     const mlpWeightsBuffer = device.createBuffer({
       size: loadedMlp.weightsFp16.byteLength,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
@@ -300,6 +390,50 @@ export class WebGPURenderer {
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
     });
     device.queue.writeBuffer(mlpMetaBuffer, 0, loadedMlp.metaUniform);
+
+    const volumeSampler = device.createSampler({
+      magFilter: "linear",
+      minFilter: "linear",
+      mipmapFilter: "linear",
+      addressModeU: "clamp-to-edge",
+      addressModeV: "clamp-to-edge",
+      addressModeW: "clamp-to-edge"
+    });
+
+    const lightingStepDistance = 2.0 / VOLUME_SIZE;
+    const sunPassParamsData = createLightingParamsBufferData(
+      normalize3(0.5, 0.78, 0.37),
+      DEFAULT_SUN_INTENSITY,
+      DEFAULT_SIGMA,
+      DEFAULT_PHASE_G,
+      DEFAULT_ALBEDO,
+      VOLUME_SIZE,
+      MULTISCATTER_LAMBDA,
+      lightingStepDistance,
+      LIGHT_MARCH_STEPS
+    );
+    const sunPassParamsBuffer = device.createBuffer({
+      size: sunPassParamsData.byteLength,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    device.queue.writeBuffer(sunPassParamsBuffer, 0, sunPassParamsData);
+
+    const multiScatterParamsData = createLightingParamsBufferData(
+      normalize3(0.5, 0.78, 0.37),
+      DEFAULT_SUN_INTENSITY,
+      DEFAULT_SIGMA,
+      DEFAULT_PHASE_G,
+      DEFAULT_ALBEDO,
+      VOLUME_SIZE,
+      MULTISCATTER_LAMBDA,
+      lightingStepDistance,
+      0
+    );
+    const multiScatterParamsBuffer = device.createBuffer({
+      size: multiScatterParamsData.byteLength,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    device.queue.writeBuffer(multiScatterParamsBuffer, 0, multiScatterParamsData);
 
     const fillPipeline = device.createComputePipeline({
       layout: "auto",
@@ -326,22 +460,139 @@ export class WebGPURenderer {
       ]
     });
 
-    const fillEncoder = device.createCommandEncoder();
-    const fillPass = fillEncoder.beginComputePass();
+    const sunTransmittancePipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: {
+        module: sunTransmittanceShader,
+        entryPoint: "csMain"
+      }
+    });
+    const sunTransmittanceBindGroup = device.createBindGroup({
+      layout: sunTransmittancePipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: volumeView
+        },
+        {
+          binding: 1,
+          resource: volumeSampler
+        },
+        {
+          binding: 2,
+          resource: sunTransmittanceView
+        },
+        {
+          binding: 3,
+          resource: { buffer: sunPassParamsBuffer }
+        }
+      ]
+    });
+
+    const multiScatterPipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: {
+        module: multiScatterShader,
+        entryPoint: "csMain"
+      }
+    });
+    const multiScatterBindGroupA = device.createBindGroup({
+      layout: multiScatterPipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: multiScatterViewA
+        },
+        {
+          binding: 1,
+          resource: multiScatterViewB
+        },
+        {
+          binding: 2,
+          resource: sunTransmittanceView
+        },
+        {
+          binding: 3,
+          resource: volumeView
+        },
+        {
+          binding: 4,
+          resource: volumeSampler
+        },
+        {
+          binding: 5,
+          resource: { buffer: multiScatterParamsBuffer }
+        }
+      ]
+    });
+    const multiScatterBindGroupB = device.createBindGroup({
+      layout: multiScatterPipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: multiScatterViewB
+        },
+        {
+          binding: 1,
+          resource: multiScatterViewA
+        },
+        {
+          binding: 2,
+          resource: sunTransmittanceView
+        },
+        {
+          binding: 3,
+          resource: volumeView
+        },
+        {
+          binding: 4,
+          resource: volumeSampler
+        },
+        {
+          binding: 5,
+          resource: { buffer: multiScatterParamsBuffer }
+        }
+      ]
+    });
+
+    const precomputeEncoder = device.createCommandEncoder();
+
+    const fillPass = precomputeEncoder.beginComputePass();
     fillPass.setPipeline(fillPipeline);
     fillPass.setBindGroup(0, fillBindGroup);
     fillPass.dispatchWorkgroups(VOLUME_SIZE / 4, VOLUME_SIZE / 4, VOLUME_SIZE / 4);
     fillPass.end();
-    device.queue.submit([fillEncoder.finish()]);
 
-    const volumeSampler = device.createSampler({
-      magFilter: "linear",
-      minFilter: "linear",
-      mipmapFilter: "linear",
-      addressModeU: "clamp-to-edge",
-      addressModeV: "clamp-to-edge",
-      addressModeW: "clamp-to-edge"
-    });
+    const sunPass = precomputeEncoder.beginComputePass();
+    sunPass.setPipeline(sunTransmittancePipeline);
+    sunPass.setBindGroup(0, sunTransmittanceBindGroup);
+    sunPass.dispatchWorkgroups(VOLUME_SIZE / 4, VOLUME_SIZE / 4, VOLUME_SIZE / 4);
+    sunPass.end();
+
+    // First multiscatter iteration seeds the field from source only.
+    multiScatterParamsData[11] = 0;
+    device.queue.writeBuffer(multiScatterParamsBuffer, 0, multiScatterParamsData);
+    const msSeedPass = precomputeEncoder.beginComputePass();
+    msSeedPass.setPipeline(multiScatterPipeline);
+    msSeedPass.setBindGroup(0, multiScatterBindGroupA);
+    msSeedPass.dispatchWorkgroups(VOLUME_SIZE / 4, VOLUME_SIZE / 4, VOLUME_SIZE / 4);
+    msSeedPass.end();
+
+    device.queue.submit([precomputeEncoder.finish()]);
+
+    for (let i = 1; i < MULTISCATTER_ITERS; i++) {
+      multiScatterParamsData[11] = i;
+      device.queue.writeBuffer(multiScatterParamsBuffer, 0, multiScatterParamsData);
+      const msIterEncoder = device.createCommandEncoder();
+      const msIterPass = msIterEncoder.beginComputePass();
+      msIterPass.setPipeline(multiScatterPipeline);
+      msIterPass.setBindGroup(0, (i & 1) === 0 ? multiScatterBindGroupA : multiScatterBindGroupB);
+      msIterPass.dispatchWorkgroups(VOLUME_SIZE / 4, VOLUME_SIZE / 4, VOLUME_SIZE / 4);
+      msIterPass.end();
+      device.queue.submit([msIterEncoder.finish()]);
+    }
+
+    const finalMultiScatterView = (MULTISCATTER_ITERS & 1) === 0 ? multiScatterViewB : multiScatterViewA;
 
     const bindGroupLayout = device.createBindGroupLayout({
       entries: [
@@ -357,6 +608,22 @@ export class WebGPURenderer {
         },
         {
           binding: 2,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: {
+            sampleType: "float",
+            viewDimension: "3d"
+          }
+        },
+        {
+          binding: 3,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: {
+            sampleType: "float",
+            viewDimension: "3d"
+          }
+        },
+        {
+          binding: 4,
           visibility: GPUShaderStage.FRAGMENT,
           texture: {
             sampleType: "float",
@@ -380,6 +647,14 @@ export class WebGPURenderer {
         {
           binding: 2,
           resource: volumeView
+        },
+        {
+          binding: 3,
+          resource: sunTransmittanceView
+        },
+        {
+          binding: 4,
+          resource: finalMultiScatterView
         }
       ]
     });
@@ -403,11 +678,23 @@ export class WebGPURenderer {
     return new WebGPURenderer(device, context, format, pipeline, bindGroup, cameraBuffer);
   }
 
+  setRenderMode(mode: RenderMode): void {
+    this.renderMode = mode;
+  }
+
+  setCloudDensity(value: number): void {
+    if (!Number.isFinite(value)) {
+      return;
+    }
+    this.sigma = Math.max(0.01, Math.min(value, 12.0));
+  }
+
   render(camera: OrbitCamera): void {
     const pos = camera.getPosition();
     const target = camera.getTarget();
     const up = camera.getUp();
     const [near, far] = camera.getNearFar();
+    const modeFlag = this.renderMode === "cloudSky" ? 1 : 0;
 
     const uniformData = new Float32Array([
       pos[0],
@@ -425,7 +712,15 @@ export class WebGPURenderer {
       camera.getAspect(),
       camera.getTanHalfFov(),
       near,
-      far
+      far,
+      modeFlag,
+      this.sigma,
+      this.phaseG,
+      0,
+      this.sunDirection[0],
+      this.sunDirection[1],
+      this.sunDirection[2],
+      this.sunIntensity
     ]);
     this.device.queue.writeBuffer(this.cameraBuffer, 0, uniformData);
 
