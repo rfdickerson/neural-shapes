@@ -30,10 +30,47 @@
     "sharpness": 14.0
   },
   "ground_truth": {
-    "type": "smooth_torus",
-    "major_radius": 0.55,
-    "minor_radius": 0.2,
-    "sharpness": 36.0
+    "type": "dense_volume",
+    "bin_path": "outputs/wdas_cloud_128.bin",
+    "meta_path": "outputs/wdas_cloud_128.json",
+    "dims": [
+      128,
+      128,
+      128
+    ],
+    "meta": {
+      "format": "dense_f32",
+      "dims": [
+        128,
+        128,
+        128
+      ],
+      "domain": "normalized_cube",
+      "domain_min": [
+        -1.0,
+        -1.0,
+        -1.0
+      ],
+      "domain_max": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "source": {
+        "vdb_path": "wdas_cloud_sixteenth.vdb",
+        "grid": "density",
+        "active_world_min": [
+          -219.999995,
+          -69.9999983,
+          -299.999993
+        ],
+        "active_world_max": [
+          199.999995,
+          216.666662,
+          213.333328
+        ]
+      }
+    }
   },
   "offsets": {
     "W0": 0,
