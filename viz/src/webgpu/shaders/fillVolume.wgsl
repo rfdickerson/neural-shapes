@@ -22,8 +22,9 @@ struct MLPMetadata {
 }
 
 struct FillParams {
-  baselineHalfExtents: vec4<f32>, // xyz = half extents
-  params: vec4<f32>, // x=baseline sharpness, y=noise floor, z=soft knee width, w=baseline scale
+  baselineHalfExtents: vec4<f32>, // xyz = half extents, w = baseline scale
+  params0: vec4<f32>, // x=baseline sharpness, y=noise floor, z=soft knee width, w=representation mode
+  params1: vec4<f32>, // x=levelset decode k, y=iso logit, z=iso value, w=reserved
 }
 
 @group(0) @binding(0) var volumeOut: texture_storage_3d<rgba16float, write>;
@@ -141,14 +142,29 @@ fn sdBox(p: vec3<f32>, halfExtents: vec3<f32>) -> f32 {
 
 fn smoothBoxBaseline(p: vec3<f32>) -> f32 {
   let sdf = sdBox(p, fillParams.baselineHalfExtents.xyz);
-  return 1.0 / (1.0 + exp(fillParams.params.x * sdf));
+  return 1.0 / (1.0 + exp(fillParams.params0.x * sdf));
+}
+
+fn densityToPhi(density: f32, decodeK: f32, isoLogit: f32) -> f32 {
+  let d = clamp(density, 1.0e-6, 1.0 - 1.0e-6);
+  let logit = log(d / (1.0 - d));
+  return (isoLogit - logit) / max(decodeK, 1.0e-6);
+}
+
+fn phiToDensity(phi: f32, decodeK: f32, isoLogit: f32) -> f32 {
+  let x = isoLogit - decodeK * phi;
+  return 1.0 / (1.0 + exp(-x));
 }
 
 fn evalRawDensity(p: vec3<f32>) -> f32 {
-  let macroDensity = fillParams.params.w * smoothBoxBaseline(p);
-  // Keep signed residual unmodified so valid cap/overhang detail is preserved.
-  // Empty-space suppression is handled by training loss + reconstruction noise floor.
   let residual = mlpResidual(p);
+  let mode = fillParams.params0.w;
+  if (mode > 0.5) {
+    let baselineSdf = fillParams.baselineHalfExtents.w * sdBox(p, fillParams.baselineHalfExtents.xyz);
+    let phi = baselineSdf + residual;
+    return clamp(phiToDensity(phi, fillParams.params1.x, fillParams.params1.y), 0.0, 1.0);
+  }
+  let macroDensity = fillParams.baselineHalfExtents.w * smoothBoxBaseline(p);
   return clamp(macroDensity + residual, 0.0, 1.0);
 }
 
@@ -177,8 +193,8 @@ fn csMain(@builtin(global_invocation_id) id: vec3<u32>) {
     rawDensity = (rawDensity + evalRawDensity(p0) + evalRawDensity(p1) + evalRawDensity(p2) + evalRawDensity(p3)) * 0.2;
   }
 
-  let floor = clamp(fillParams.params.y, 0.0, 1.0);
-  let knee = max(fillParams.params.z, 1.0e-4);
+  let floor = clamp(fillParams.params0.y, 0.0, 1.0);
+  let knee = max(fillParams.params0.z, 1.0e-4);
   let gate = smoothstep(floor, floor + knee, rawDensity);
   let density = rawDensity * gate;
 

@@ -75,6 +75,21 @@ def box_density(points: torch.Tensor) -> torch.Tensor:
     return density_from_sdf(sdf_box(points), sharpness=BOX_SHARPNESS)
 
 
+def density_to_phi(density: torch.Tensor, iso_value: float, decode_k: float, eps: float = 1.0e-6) -> torch.Tensor:
+    iso = float(max(eps, min(1.0 - eps, iso_value)))
+    k = float(max(1.0e-6, decode_k))
+    d = density.clamp(eps, 1.0 - eps)
+    iso_logit = math.log(iso / (1.0 - iso))
+    return (iso_logit - torch.log(d / (1.0 - d))) / k
+
+
+def phi_to_density(phi: torch.Tensor, iso_value: float, decode_k: float) -> torch.Tensor:
+    iso = float(max(1.0e-6, min(1.0 - 1.0e-6, iso_value)))
+    k = float(max(1.0e-6, decode_k))
+    iso_logit = math.log(iso / (1.0 - iso))
+    return torch.sigmoid(iso_logit - k * phi)
+
+
 def load_dense_volume(
     volume_bin_path: Path,
     volume_meta_path: Path | None,
@@ -324,7 +339,10 @@ def sample_batch(
     iso_shell_ratio: float,
     iso_value: float,
     iso_band: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    residual_representation: str,
+    levelset_decode_k: float,
+    levelset_density_eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if target_source == "torus":
         points = torch.rand(batch_size, 3, device=device) * 2.0 - 1.0
         gt = torus_density(points)
@@ -461,9 +479,20 @@ def sample_batch(
         gt = gt[perm]
     else:
         raise ValueError(f"unsupported target_source '{target_source}'")
-    baseline = baseline_scale * box_density(points)
-    residual = (gt - baseline).unsqueeze(-1)
-    return points, residual, gt.unsqueeze(-1)
+    if residual_representation == "levelset":
+        baseline_field = baseline_scale * sdf_box(points)
+        target_field = density_to_phi(
+            gt,
+            iso_value=iso_value,
+            decode_k=levelset_decode_k,
+            eps=levelset_density_eps,
+        )
+    else:
+        baseline_field = baseline_scale * box_density(points)
+        target_field = gt
+
+    residual = (target_field - baseline_field).unsqueeze(-1)
+    return points, residual, gt.unsqueeze(-1), baseline_field.unsqueeze(-1)
 
 
 def residual_loss_terms(
@@ -536,6 +565,10 @@ def export_model(
     encoding_levels: int,
     ground_truth_info: Dict[str, Any],
     baseline_scale: float,
+    residual_representation: str,
+    levelset_decode_k: float,
+    levelset_density_eps: float,
+    levelset_iso_value: float,
     output_dir: Path,
     weights_name: str = "residual_mlp_weights.bin",
     meta_name: str = "residual_mlp_metadata.json",
@@ -562,9 +595,24 @@ def export_model(
 
     weights_path.write_bytes(blob)
 
+    if residual_representation == "levelset":
+        baseline_type = "sdf_box"
+        reconstruction_info = {
+            "type": "sigmoid_levelset",
+            "iso_value": float(levelset_iso_value),
+            "decode_k": float(levelset_decode_k),
+            "density_epsilon": float(levelset_density_eps),
+        }
+    else:
+        baseline_type = "smooth_box"
+        reconstruction_info = {
+            "type": "additive_density_residual",
+        }
+
     metadata = {
         "layout": "[W0][b0][W1][b1][W2][b2]",
         "dtype": "float32",
+        "residual_representation": residual_representation,
         "encoding": {
             "type": "fourier",
             "levels": encoding_levels,
@@ -585,11 +633,13 @@ def export_model(
             ]
         },
         "baseline": {
-            "type": "smooth_box",
+            "type": baseline_type,
             "half_extents": list(BOX_HALF_EXTENTS),
             "sharpness": BOX_SHARPNESS,
             "scale": baseline_scale,
+            "sdf_scale": baseline_scale,
         },
+        "reconstruction": reconstruction_info,
         "ground_truth": ground_truth_info,
         "offsets": offsets,
         "counts": counts,
@@ -639,6 +689,12 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError(f"--hidden-layers values must be > 0, got {args.hidden_layers}")
     if args.baseline_scale <= 0:
         raise ValueError(f"--baseline-scale must be > 0, got {args.baseline_scale}")
+    if args.target_field not in ("density", "levelset"):
+        raise ValueError(f"--target-field must be one of ['density', 'levelset'], got {args.target_field}")
+    if args.levelset_decode_k <= 0:
+        raise ValueError(f"--levelset-decode-k must be > 0, got {args.levelset_decode_k}")
+    if args.levelset_density_eps <= 0 or args.levelset_density_eps >= 0.25:
+        raise ValueError(f"--levelset-density-eps must be in (0, 0.25), got {args.levelset_density_eps}")
     if args.grad_reg_coeff < 0:
         raise ValueError(f"--grad-reg-coeff must be >= 0, got {args.grad_reg_coeff}")
     if args.loss_weight_abs_scale < 0:
@@ -703,7 +759,15 @@ def train(args: argparse.Namespace) -> None:
         f"lr_start={args.lr:.6f}, lr_final={args.lr_final:.6f}, "
         f"lr_warmup_steps={args.lr_warmup_steps}, loss_ramp_steps={args.loss_ramp_steps}"
     )
-    print(f"Baseline: smooth_box scale={args.baseline_scale:.3f}, sharpness={BOX_SHARPNESS:.3f}")
+    if args.target_field == "levelset":
+        print(
+            "Target field: levelset residual "
+            f"(iso={args.iso_value:.3f}, decode_k={args.levelset_decode_k:.3f}, eps={args.levelset_density_eps:.1e})"
+        )
+        print(f"Baseline: sdf_box scale={args.baseline_scale:.3f}")
+    else:
+        print("Target field: density residual (additive)")
+        print(f"Baseline: smooth_box scale={args.baseline_scale:.3f}, sharpness={BOX_SHARPNESS:.3f}")
 
     target_source = str(args.target_source).strip().lower()
     target_volume: torch.Tensor | None = None
@@ -816,7 +880,7 @@ def train(args: argparse.Namespace) -> None:
         iso_weight_eff = args.loss_iso_weight * loss_ramp
         empty_weight_eff = args.loss_empty_space_weight * loss_ramp
 
-        points, target_residual, target_density = sample_batch(
+        points, target_residual, target_density, baseline_field = sample_batch(
             batch_size=args.batch_size,
             device=device,
             target_source=target_source,
@@ -830,12 +894,22 @@ def train(args: argparse.Namespace) -> None:
             iso_shell_ratio=args.iso_shell_ratio,
             iso_value=args.iso_value,
             iso_band=args.iso_band,
+            residual_representation=args.target_field,
+            levelset_decode_k=args.levelset_decode_k,
+            levelset_density_eps=args.levelset_density_eps,
         )
         points.requires_grad_(args.grad_reg_coeff > 0.0)
         encoded = encoder(points)
         pred_residual = model(encoded)
-        baseline_from_targets = target_density - target_residual
-        pred_density = torch.clamp(baseline_from_targets + pred_residual, 0.0, 1.0)
+        pred_field = baseline_field + pred_residual
+        if args.target_field == "levelset":
+            pred_density = phi_to_density(
+                pred_field,
+                iso_value=args.iso_value,
+                decode_k=args.levelset_decode_k,
+            )
+        else:
+            pred_density = torch.clamp(pred_field, 0.0, 1.0)
 
         data_objective, mse, l1 = residual_loss_terms(
             pred_residual=pred_residual,
@@ -895,7 +969,7 @@ def train(args: argparse.Namespace) -> None:
             eval_sets.append(("eval", target_source, None))
 
         for label, eval_source, eval_bank in eval_sets:
-            points, target_residual, target_density = sample_batch(
+            points, target_residual, target_density, baseline_field = sample_batch(
                 batch_size=args.eval_samples,
                 device=device,
                 target_source=eval_source,
@@ -909,10 +983,20 @@ def train(args: argparse.Namespace) -> None:
                 iso_shell_ratio=args.iso_shell_ratio,
                 iso_value=args.iso_value,
                 iso_band=args.iso_band,
+                residual_representation=args.target_field,
+                levelset_decode_k=args.levelset_decode_k,
+                levelset_density_eps=args.levelset_density_eps,
             )
             eval_pred = model(encoder(points))
-            eval_baseline_from_targets = target_density - target_residual
-            eval_pred_density = torch.clamp(eval_baseline_from_targets + eval_pred, 0.0, 1.0)
+            eval_pred_field = baseline_field + eval_pred
+            if args.target_field == "levelset":
+                eval_pred_density = phi_to_density(
+                    eval_pred_field,
+                    iso_value=args.iso_value,
+                    decode_k=args.levelset_decode_k,
+                )
+            else:
+                eval_pred_density = torch.clamp(eval_pred_field, 0.0, 1.0)
             eval_objective, eval_mse, eval_l1 = residual_loss_terms(
                 pred_residual=eval_pred,
                 target_residual=target_residual,
@@ -939,6 +1023,9 @@ def train(args: argparse.Namespace) -> None:
 
     ground_truth_info["training_focus"] = {
         "type": "iso_surface_shell",
+        "target_field": args.target_field,
+        "levelset_decode_k": float(args.levelset_decode_k),
+        "levelset_density_eps": float(args.levelset_density_eps),
         "iso_value": float(args.iso_value),
         "iso_band": float(args.iso_band),
         "iso_shell_ratio": float(args.iso_shell_ratio),
@@ -952,6 +1039,10 @@ def train(args: argparse.Namespace) -> None:
         encoding_levels=args.fourier_levels,
         ground_truth_info=ground_truth_info,
         baseline_scale=args.baseline_scale,
+        residual_representation=args.target_field,
+        levelset_decode_k=args.levelset_decode_k,
+        levelset_density_eps=args.levelset_density_eps,
+        levelset_iso_value=args.iso_value,
         output_dir=Path(args.output_dir),
         weights_name=args.weights_name,
         meta_name=args.meta_name,
@@ -996,8 +1087,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--baseline-scale",
         type=float,
-        default=0.8,
-        help="Scale factor applied to smooth box baseline before residual target computation.",
+        default=1.0,
+        help="Scale factor applied to baseline field (smooth box for density mode, SDF box for levelset mode).",
+    )
+    p.add_argument(
+        "--target-field",
+        type=str,
+        default="levelset",
+        choices=["density", "levelset"],
+        help="Residual target space: additive density residual or levelset (phi) residual.",
+    )
+    p.add_argument(
+        "--levelset-decode-k",
+        type=float,
+        default=16.0,
+        help="Sharpness used for levelset<->density mapping: density = sigmoid(logit(iso) - k*phi).",
+    )
+    p.add_argument(
+        "--levelset-density-eps",
+        type=float,
+        default=1e-3,
+        help="Clamp epsilon for stable density->levelset logit conversion.",
     )
     p.add_argument(
         "--grad-reg-coeff",

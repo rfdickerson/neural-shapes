@@ -34,6 +34,7 @@ export type DensitySource = "neural" | "texture";
 interface ExportMetadata {
   layout: string;
   dtype: string;
+  residual_representation?: string;
   encoding: {
     levels: number;
     include_input?: boolean;
@@ -52,6 +53,13 @@ interface ExportMetadata {
     half_extents?: number[];
     sharpness?: number;
     scale?: number;
+    sdf_scale?: number;
+  };
+  reconstruction?: {
+    type?: string;
+    iso_value?: number;
+    decode_k?: number;
+    density_epsilon?: number;
   };
   offsets: Record<string, number>;
   total_floats: number;
@@ -263,7 +271,7 @@ async function loadExportedMlpData(): Promise<LoadedMlpData> {
         : (() => {
             throw new Error("MLP metadata baseline.sharpness must be a positive number.");
           })();
-  const baselineScaleRaw = meta.baseline?.scale;
+  const baselineScaleRaw = meta.baseline?.sdf_scale ?? meta.baseline?.scale;
   const baselineScale =
     baselineScaleRaw === undefined
       ? DEFAULT_BASELINE_SCALE
@@ -273,11 +281,38 @@ async function loadExportedMlpData(): Promise<LoadedMlpData> {
             throw new Error("MLP metadata baseline.scale must be a positive number.");
           })();
 
+  const residualRepresentation =
+    meta.residual_representation === "levelset" || meta.reconstruction?.type === "sigmoid_levelset"
+      ? "levelset"
+      : "density";
+  const representationMode = residualRepresentation === "levelset" ? 1 : 0;
+  const levelsetDecodeKRaw = meta.reconstruction?.decode_k;
+  const levelsetDecodeK =
+    levelsetDecodeKRaw === undefined
+      ? 16.0
+      : Number.isFinite(levelsetDecodeKRaw) && levelsetDecodeKRaw > 0
+        ? levelsetDecodeKRaw
+        : (() => {
+            throw new Error("MLP metadata reconstruction.decode_k must be a positive number.");
+          })();
+  const levelsetIsoValueRaw = meta.reconstruction?.iso_value;
+  const levelsetIsoValue =
+    levelsetIsoValueRaw === undefined
+      ? 0.1
+      : Number.isFinite(levelsetIsoValueRaw) && levelsetIsoValueRaw > 0 && levelsetIsoValueRaw < 1
+        ? levelsetIsoValueRaw
+        : (() => {
+            throw new Error("MLP metadata reconstruction.iso_value must be in (0, 1).");
+          })();
+
   const fillParamsUniform = createReconstructionParamsBufferData(
     DEFAULT_RECON_NOISE_FLOOR,
     baselineHalfExtents,
     baselineSharpness,
-    baselineScale
+    baselineScale,
+    representationMode,
+    levelsetDecodeK,
+    levelsetIsoValue
   );
 
   return { weightsFp16, metaUniform, fillParamsUniform };
@@ -429,17 +464,26 @@ function createReconstructionParamsBufferData(
   noiseFloor: number,
   baselineHalfExtents: [number, number, number],
   baselineSharpness: number,
-  baselineScale: number
+  baselineScale: number,
+  representationMode: number,
+  levelsetDecodeK: number,
+  levelsetIsoValue: number
 ): Float32Array<ArrayBuffer> {
-  const data = new Float32Array<ArrayBuffer>(new ArrayBuffer(8 * 4)); // 2 vec4
+  const data = new Float32Array<ArrayBuffer>(new ArrayBuffer(12 * 4)); // 3 vec4
+  const iso = Math.max(1e-6, Math.min(levelsetIsoValue, 1.0 - 1e-6));
+  const isoLogit = Math.log(iso / (1.0 - iso));
   data[0] = baselineHalfExtents[0];
   data[1] = baselineHalfExtents[1];
   data[2] = baselineHalfExtents[2];
-  data[3] = 0;
+  data[3] = baselineScale;
   data[4] = baselineSharpness;
   data[5] = noiseFloor;
   data[6] = RECON_NOISE_KNEE;
-  data[7] = baselineScale;
+  data[7] = representationMode;
+  data[8] = levelsetDecodeK;
+  data[9] = isoLogit;
+  data[10] = iso;
+  data[11] = 0;
   return data;
 }
 

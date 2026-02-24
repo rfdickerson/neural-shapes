@@ -36,8 +36,9 @@ struct MLPMetadata {
 }
 
 struct FillParams {
-  baselineHalfExtents: vec4<f32>, // xyz = half extents
-  params: vec4<f32>, // x=baseline sharpness, y=noise floor, z=soft knee width, w=baseline scale
+  baselineHalfExtents: vec4<f32>, // xyz = half extents, w = baseline scale
+  params0: vec4<f32>, // x=baseline sharpness, y=noise floor, z=soft knee width, w=representation mode
+  params1: vec4<f32>, // x=levelset decode k, y=iso logit, z=iso value, w=reserved
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
@@ -84,7 +85,7 @@ fn sdBox(p: vec3<f32>, halfExtents: vec3<f32>) -> f32 {
 
 fn smoothBoxBaseline(p: vec3<f32>) -> f32 {
   let sdf = sdBox(p, fillParams.baselineHalfExtents.xyz);
-  return 1.0 / (1.0 + exp(fillParams.params.x * sdf));
+  return 1.0 / (1.0 + exp(fillParams.params0.x * sdf));
 }
 
 fn encodePosition(p: vec3<f32>) -> array<f32, ENCODED_DIM> {

@@ -1,6 +1,7 @@
 {
   "layout": "[W0][b0][W1][b1][W2][b2]",
   "dtype": "float32",
+  "residual_representation": "levelset",
   "encoding": {
     "type": "fourier",
     "levels": 6,
@@ -21,14 +22,21 @@
     ]
   },
   "baseline": {
-    "type": "smooth_box",
+    "type": "sdf_box",
     "half_extents": [
       0.6,
       0.25,
       0.6
     ],
     "sharpness": 14.0,
-    "scale": 0.8
+    "scale": 1.0,
+    "sdf_scale": 1.0
+  },
+  "reconstruction": {
+    "type": "sigmoid_levelset",
+    "iso_value": 0.1,
+    "decode_k": 16.0,
+    "density_epsilon": 0.001
   },
   "ground_truth": {
     "type": "sparse_samples",
@@ -77,6 +85,9 @@
     },
     "training_focus": {
       "type": "iso_surface_shell",
+      "target_field": "levelset",
+      "levelset_decode_k": 16.0,
+      "levelset_density_eps": 0.001,
       "iso_value": 0.1,
       "iso_band": 0.05,
       "iso_shell_ratio": 0.35,

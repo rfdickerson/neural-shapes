@@ -28,6 +28,9 @@ VAL_RATIO="${VAL_RATIO:-0.10}"
 LR_FINAL="${LR_FINAL:-1e-4}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-300}"
 LOSS_RAMP_STEPS="${LOSS_RAMP_STEPS:-3000}"
+TARGET_FIELD="${TARGET_FIELD:-levelset}"
+LEVELSET_DECODE_K="${LEVELSET_DECODE_K:-16.0}"
+LEVELSET_DENSITY_EPS="${LEVELSET_DENSITY_EPS:-1e-3}"
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   "$PYTHON" "$TRAIN_DIR/train_torus_residual.py" --help
@@ -64,6 +67,9 @@ fi
   --lr-final "$LR_FINAL" \
   --lr-warmup-steps "$LR_WARMUP_STEPS" \
   --loss-ramp-steps "$LOSS_RAMP_STEPS" \
+  --target-field "$TARGET_FIELD" \
+  --levelset-decode-k "$LEVELSET_DECODE_K" \
+  --levelset-density-eps "$LEVELSET_DENSITY_EPS" \
   --output-dir "$TRAIN_DIR/outputs" \
   --copy-to-viz \
   --viz-mlp-dir "$ROOT_DIR/viz/public/mlp" \
