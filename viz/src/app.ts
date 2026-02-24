@@ -18,8 +18,16 @@ export class App {
   private readonly camera: OrbitCamera;
 
   constructor(container: HTMLElement) {
-    const controls = document.createElement("div");
-    controls.className = "controls";
+    const controlsStack = document.createElement("div");
+    controlsStack.className = "controls-stack";
+
+    const cloudPanel = document.createElement("section");
+    cloudPanel.className = "controls-panel";
+
+    const cloudTitle = document.createElement("h3");
+    cloudTitle.className = "controls__title";
+    cloudTitle.textContent = "Cloud Parameters";
+    cloudPanel.appendChild(cloudTitle);
 
     const label = document.createElement("label");
     label.className = "controls__label";
@@ -33,19 +41,25 @@ export class App {
       <option value="cloudSky">Cloud + Sky</option>
       <option value="fogOnly">Fog Only</option>
     `;
+    const modeRow = document.createElement("div");
+    modeRow.className = "controls__row";
+    modeRow.append(label, this.modeSelect);
+    cloudPanel.appendChild(modeRow);
 
-    const detailToggleLabel = document.createElement("label");
-    detailToggleLabel.className = "controls__toggle";
-    detailToggleLabel.htmlFor = "detail-noise-toggle";
+    const detailLabel = document.createElement("label");
+    detailLabel.className = "controls__label";
+    detailLabel.htmlFor = "detail-noise-toggle";
+    detailLabel.textContent = "Detail Noise";
 
     this.detailNoiseToggle = document.createElement("input");
     this.detailNoiseToggle.id = "detail-noise-toggle";
     this.detailNoiseToggle.type = "checkbox";
+    this.detailNoiseToggle.className = "controls__checkbox";
     this.detailNoiseToggle.checked = true;
-
-    const detailToggleText = document.createElement("span");
-    detailToggleText.textContent = "Detail Noise";
-    detailToggleLabel.append(this.detailNoiseToggle, detailToggleText);
+    const detailRow = document.createElement("div");
+    detailRow.className = "controls__row controls__row--toggle";
+    detailRow.append(detailLabel, this.detailNoiseToggle);
+    cloudPanel.appendChild(detailRow);
 
     const densityLabel = document.createElement("label");
     densityLabel.className = "controls__label";
@@ -64,6 +78,21 @@ export class App {
     this.densityValue = document.createElement("span");
     this.densityValue.className = "controls__value";
     this.densityValue.textContent = Number(this.densitySlider.value).toFixed(2);
+    const densityField = document.createElement("div");
+    densityField.className = "controls__field";
+    densityField.append(this.densitySlider, this.densityValue);
+    const densityRow = document.createElement("div");
+    densityRow.className = "controls__row";
+    densityRow.append(densityLabel, densityField);
+    cloudPanel.appendChild(densityRow);
+
+    const sunPanel = document.createElement("section");
+    sunPanel.className = "controls-panel";
+
+    const sunTitle = document.createElement("h3");
+    sunTitle.className = "controls__title";
+    sunTitle.textContent = "Sun Controls";
+    sunPanel.appendChild(sunTitle);
 
     const pitchLabel = document.createElement("label");
     pitchLabel.className = "controls__label";
@@ -82,6 +111,13 @@ export class App {
     this.sunPitchValue = document.createElement("span");
     this.sunPitchValue.className = "controls__value";
     this.sunPitchValue.textContent = `${Math.round(Number(this.sunPitchSlider.value))}deg`;
+    const pitchField = document.createElement("div");
+    pitchField.className = "controls__field";
+    pitchField.append(this.sunPitchSlider, this.sunPitchValue);
+    const pitchRow = document.createElement("div");
+    pitchRow.className = "controls__row";
+    pitchRow.append(pitchLabel, pitchField);
+    sunPanel.appendChild(pitchRow);
 
     const azimuthLabel = document.createElement("label");
     azimuthLabel.className = "controls__label";
@@ -100,22 +136,16 @@ export class App {
     this.sunAzimuthValue = document.createElement("span");
     this.sunAzimuthValue.className = "controls__value";
     this.sunAzimuthValue.textContent = `${Math.round(Number(this.sunAzimuthSlider.value))}deg`;
+    const azimuthField = document.createElement("div");
+    azimuthField.className = "controls__field";
+    azimuthField.append(this.sunAzimuthSlider, this.sunAzimuthValue);
+    const azimuthRow = document.createElement("div");
+    azimuthRow.className = "controls__row";
+    azimuthRow.append(azimuthLabel, azimuthField);
+    sunPanel.appendChild(azimuthRow);
 
-    controls.append(
-      label,
-      this.modeSelect,
-      detailToggleLabel,
-      densityLabel,
-      this.densitySlider,
-      this.densityValue,
-      pitchLabel,
-      this.sunPitchSlider,
-      this.sunPitchValue,
-      azimuthLabel,
-      this.sunAzimuthSlider,
-      this.sunAzimuthValue
-    );
-    container.appendChild(controls);
+    controlsStack.append(cloudPanel, sunPanel);
+    container.appendChild(controlsStack);
 
     this.canvas = document.createElement("canvas");
     this.canvas.className = "viewport";
