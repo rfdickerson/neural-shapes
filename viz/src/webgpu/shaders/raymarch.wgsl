@@ -175,7 +175,7 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
   var transmittance = 1.0;
   var accum = 0.0;
   var cloudAccum = vec3f(0.0);
-  let maxSteps = 128u;
+  let maxSteps = 192u;
   let totalDist = tEnd - tStart;
   let stepSize = totalDist / f32(maxSteps);
   let jitterFactor = hash(in.uv);
@@ -189,29 +189,39 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
   let ambientBase = mix(vec3f(0.08, 0.10, 0.14), vec3f(0.18, 0.10, 0.16), sunset);
   let ambientTerm = mix(ambientBase, ambientSky, 0.35) * cloudAlbedo;
 
+  var t = tStart + jitterFactor * stepSize;
   for (var i = 0u; i < maxSteps; i++) {
-    if (transmittance < 0.01) {
+    if (transmittance < 0.005 || t > tEnd) {
       break;
     }
-    let t = tStart + (f32(i) + jitterFactor) * stepSize;
     let p = camPos + rayDir * t;
     let d = density(p);
+    let densityMask = smoothstep(0.02, 0.24, d);
+    let localStep = mix(stepSize * 1.35, stepSize * 0.55, densityMask);
     if (d <= 1e-4) {
+      t += localStep;
       continue;
     }
     let sigmaT = d * sigma;
-    let segmentTransmittance = exp(-sigmaT * stepSize);
+    let segmentTransmittance = exp(-sigmaT * localStep);
     let contrib = transmittance * (1.0 - segmentTransmittance);
     if (modeFlag > 0.5) {
       let sunTr = sampleSunTransmittance(p);
-      let direct = sunRadiance * sunPhase * sunTr * cloudAlbedo;
+      let n = estimateNormal(p, localStep * 0.75);
+      let ndotl = max(dot(n, sunDir), 0.0);
+      let viewFacing = max(dot(n, -rayDir), 0.0);
+      let rim = pow(1.0 - viewFacing, 2.0);
+
+      let direct = sunRadiance * sunPhase * sunTr * cloudAlbedo * (0.70 + 0.30 * ndotl);
       let indirect = sampleMultiScatter(p) * 0.45;
-      let scattering = ambientTerm + direct + indirect;
-      cloudAccum += scattering * contrib;
+      let edgeAccent = 1.0 + rim * 0.25;
+      let scattering = ambientTerm * 0.88 + direct + indirect;
+      cloudAccum += scattering * contrib * edgeAccent;
     } else {
       accum += contrib;
     }
     transmittance *= segmentTransmittance;
+    t += localStep;
   }
 
   if (modeFlag > 0.5) {

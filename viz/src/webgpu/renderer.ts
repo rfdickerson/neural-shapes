@@ -7,7 +7,7 @@ import type { OrbitCamera } from "./orbitCamera";
 const CAMERA_UNIFORM_BYTES = 96;
 const VOLUME_SIZE = 128;
 const SHADER_MAX_INPUT_DIM = 27;
-const SHADER_MAX_HIDDEN = 64;
+const SHADER_MAX_HIDDEN = 128;
 const MLP_META_URL = "/mlp/residual_mlp_metadata.json";
 const MLP_WEIGHTS_URL = "/mlp/residual_mlp_weights.bin";
 const EXPECTED_ENCODING_ORDER = "input_xyz_then_per_level_sin_xyz_cos_xyz";

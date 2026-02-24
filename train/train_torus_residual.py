@@ -308,6 +308,12 @@ def train(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     if args.fourier_levels < 1:
         raise ValueError("fourier_levels must be >= 1 to enable positional encoding.")
+    if len(args.hidden_layers) != 2:
+        raise ValueError("--hidden-layers must provide exactly 2 integers, e.g. --hidden-layers 128 128")
+    hidden0 = int(args.hidden_layers[0])
+    hidden1 = int(args.hidden_layers[1])
+    if hidden0 <= 0 or hidden1 <= 0:
+        raise ValueError(f"--hidden-layers values must be > 0, got {args.hidden_layers}")
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Device: {device}")
@@ -315,6 +321,7 @@ def train(args: argparse.Namespace) -> None:
         "Encoding: include_input=True, levels="
         f"{args.fourier_levels}, order=input_xyz_then_per_level_sin_xyz_cos_xyz, freq=2**i (no 2pi)"
     )
+    print(f"MLP hidden layers: [{hidden0}, {hidden1}]")
 
     target_source = str(args.target_source).strip().lower()
     target_volume: torch.Tensor | None = None
@@ -351,7 +358,7 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError(f"--target-source must be one of ['torus', 'volume'], got '{args.target_source}'")
 
     encoder = FourierEncoding(levels=args.fourier_levels).to(device)
-    model = ResidualMLP(input_dim=encoder.output_dim, hidden_sizes=(64, 64), output_dim=1).to(device)
+    model = ResidualMLP(input_dim=encoder.output_dim, hidden_sizes=(hidden0, hidden1), output_dim=1).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     ema_loss = None
@@ -437,6 +444,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--target-mse", type=float, default=5e-5)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--fourier-levels", type=int, default=4)
+    p.add_argument(
+        "--hidden-layers",
+        type=int,
+        nargs=2,
+        default=[128, 128],
+        metavar=("H0", "H1"),
+        help="Two hidden layer sizes for the residual MLP (default: 128 128).",
+    )
     p.add_argument("--target-source", type=str, default="torus", choices=["torus", "volume"])
     p.add_argument(
         "--volume-bin",

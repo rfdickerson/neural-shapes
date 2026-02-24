@@ -1,7 +1,7 @@
 enable f16;
 
 const ENCODED_DIM = 27u;
-const MAX_HIDDEN = 64u;
+const MAX_HIDDEN = 128u;
 const BOX_HALF_EXTENTS = vec3<f32>(0.6, 0.25, 0.6);
 const BOX_SHARPNESS = 14.0;
 const DENSITY_WRITE_CUTOFF = 0.14;
