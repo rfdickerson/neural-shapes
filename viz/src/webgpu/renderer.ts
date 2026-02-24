@@ -6,8 +6,8 @@ import type { OrbitCamera } from "./orbitCamera";
 
 const CAMERA_UNIFORM_BYTES = 96;
 const VOLUME_SIZE = 128;
-const SHADER_MAX_INPUT_DIM = 27;
-const SHADER_MAX_HIDDEN = 128;
+const SHADER_MAX_INPUT_DIM = 39;
+const SHADER_MAX_HIDDEN = 256;
 const MLP_META_URL = "/mlp/residual_mlp_metadata.json";
 const MLP_WEIGHTS_URL = "/mlp/residual_mlp_weights.bin";
 const EXPECTED_ENCODING_ORDER = "input_xyz_then_per_level_sin_xyz_cos_xyz";
@@ -22,6 +22,7 @@ const DEFAULT_RECON_NOISE_FLOOR = 0.02;
 const RECON_NOISE_KNEE = 0.03;
 const DEFAULT_BASELINE_HALF_EXTENTS: [number, number, number] = [0.6, 0.25, 0.6];
 const DEFAULT_BASELINE_SHARPNESS = 14.0;
+const DEFAULT_BASELINE_SCALE = 1.0;
 
 export type RenderMode = "cloudSky" | "fogOnly";
 
@@ -45,6 +46,7 @@ interface ExportMetadata {
     type?: string;
     half_extents?: number[];
     sharpness?: number;
+    scale?: number;
   };
   offsets: Record<string, number>;
   total_floats: number;
@@ -172,8 +174,8 @@ async function loadExportedMlpData(): Promise<LoadedMlpData> {
   if (fourierLevels < 1) {
     throw new Error(`Renderer requires fourierLevels >= 1, got ${fourierLevels}.`);
   }
-  if (fourierLevels > 4) {
-    throw new Error(`fourierLevels=${fourierLevels} exceeds shader max 4.`);
+  if (fourierLevels > 6) {
+    throw new Error(`fourierLevels=${fourierLevels} exceeds shader max 6.`);
   }
   const expectedEncodedDims = 3 + 6 * fourierLevels;
   if (encodedDims !== expectedEncodedDims) {
@@ -256,11 +258,21 @@ async function loadExportedMlpData(): Promise<LoadedMlpData> {
         : (() => {
             throw new Error("MLP metadata baseline.sharpness must be a positive number.");
           })();
+  const baselineScaleRaw = meta.baseline?.scale;
+  const baselineScale =
+    baselineScaleRaw === undefined
+      ? DEFAULT_BASELINE_SCALE
+      : Number.isFinite(baselineScaleRaw) && baselineScaleRaw > 0
+        ? baselineScaleRaw
+        : (() => {
+            throw new Error("MLP metadata baseline.scale must be a positive number.");
+          })();
 
   const fillParamsUniform = createReconstructionParamsBufferData(
     DEFAULT_RECON_NOISE_FLOOR,
     baselineHalfExtents,
-    baselineSharpness
+    baselineSharpness,
+    baselineScale
   );
 
   return { weightsFp16, metaUniform, fillParamsUniform };
@@ -313,7 +325,8 @@ function densityControlToSigma(value: number): number {
 function createReconstructionParamsBufferData(
   noiseFloor: number,
   baselineHalfExtents: [number, number, number],
-  baselineSharpness: number
+  baselineSharpness: number,
+  baselineScale: number
 ): Float32Array<ArrayBuffer> {
   const data = new Float32Array<ArrayBuffer>(new ArrayBuffer(8 * 4)); // 2 vec4
   data[0] = baselineHalfExtents[0];
@@ -323,7 +336,7 @@ function createReconstructionParamsBufferData(
   data[4] = baselineSharpness;
   data[5] = noiseFloor;
   data[6] = RECON_NOISE_KNEE;
-  data[7] = 0;
+  data[7] = baselineScale;
   return data;
 }
 

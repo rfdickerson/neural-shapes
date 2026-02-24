@@ -1,7 +1,7 @@
 enable f16;
 
-const ENCODED_DIM = 27u;
-const MAX_HIDDEN = 128u;
+const ENCODED_DIM = 39u;
+const MAX_HIDDEN = 256u;
 
 struct MLPMetadata {
   inputDim: u32,
@@ -20,7 +20,7 @@ struct MLPMetadata {
 
 struct FillParams {
   baselineHalfExtents: vec4<f32>, // xyz = half extents
-  params: vec4<f32>, // x=baseline sharpness, y=noise floor, z=soft knee width
+  params: vec4<f32>, // x=baseline sharpness, y=noise floor, z=soft knee width, w=baseline scale
 }
 
 @group(0) @binding(0) var volumeOut: texture_storage_3d<rgba16float, write>;
@@ -151,7 +151,7 @@ fn csMain(@builtin(global_invocation_id) id: vec3<u32>) {
   let uvw = vec3<f32>(id) / vec3<f32>(dims - 1u);
   let p = uvw * 2.0 - 1.0;
 
-  let macroDensity = smoothBoxBaseline(p);
+  let macroDensity = fillParams.params.w * smoothBoxBaseline(p);
   let residual = mlpResidual(p); // keep signed so negative values can carve holes
   let rawDensity = clamp(macroDensity + residual, 0.0, 1.0);
   let floor = clamp(fillParams.params.y, 0.0, 1.0);

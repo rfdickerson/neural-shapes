@@ -3,20 +3,20 @@
   "dtype": "float32",
   "encoding": {
     "type": "fourier",
-    "levels": 4,
+    "levels": 6,
     "include_input": true,
     "frequency_base": 2.0,
     "uses_two_pi": false,
     "ordering": "input_xyz_then_per_level_sin_xyz_cos_xyz",
     "axis_order": "xyz",
     "input_dims": 3,
-    "encoded_dims": 27
+    "encoded_dims": 39
   },
   "network": {
     "layers": [
-      27,
-      128,
-      128,
+      39,
+      192,
+      192,
       1
     ]
   },
@@ -27,23 +27,24 @@
       0.25,
       0.6
     ],
-    "sharpness": 14.0
+    "sharpness": 14.0,
+    "scale": 0.8
   },
   "ground_truth": {
     "type": "dense_volume",
-    "bin_path": "outputs/wdas_cloud_128.bin",
-    "meta_path": "outputs/wdas_cloud_128.json",
+    "bin_path": "/home/rfdic/projects/neural-clouds/train/outputs/wdas_cloud_quarter_256.bin",
+    "meta_path": "/home/rfdic/projects/neural-clouds/train/outputs/wdas_cloud_quarter_256.json",
     "dims": [
-      128,
-      128,
-      128
+      256,
+      256,
+      256
     ],
     "meta": {
       "format": "dense_f32",
       "dims": [
-        128,
-        128,
-        128
+        256,
+        256,
+        256
       ],
       "domain": "normalized_cube",
       "domain_min": [
@@ -57,60 +58,60 @@
         1.0
       ],
       "source": {
-        "vdb_path": "wdas_cloud_sixteenth.vdb",
+        "vdb_path": "./train/wdas_cloud_quarter.vdb",
         "grid": "density",
         "active_world_min": [
-          -219.999995,
-          -69.9999983,
-          -299.999993
+          -217.499995,
+          -67.4999984,
+          -298.333326
         ],
         "active_world_max": [
-          199.999995,
-          216.666662,
-          213.333328
+          197.499995,
+          214.166662,
+          212.499995
         ]
       }
     }
   },
   "offsets": {
     "W0": 0,
-    "b0": 3456,
-    "W1": 3584,
-    "b1": 19968,
-    "W2": 20096,
-    "b2": 20224
+    "b0": 7488,
+    "W1": 7680,
+    "b1": 44544,
+    "W2": 44736,
+    "b2": 44928
   },
   "counts": {
-    "W0": 3456,
-    "b0": 128,
-    "W1": 16384,
-    "b1": 128,
-    "W2": 128,
+    "W0": 7488,
+    "b0": 192,
+    "W1": 36864,
+    "b1": 192,
+    "W2": 192,
     "b2": 1
   },
   "shapes": {
     "W0": [
-      128,
-      27
+      192,
+      39
     ],
     "b0": [
-      128
+      192
     ],
     "W1": [
-      128,
-      128
+      192,
+      192
     ],
     "b1": [
-      128
+      192
     ],
     "W2": [
       1,
-      128
+      192
     ],
     "b2": [
       1
     ]
   },
-  "total_floats": 20225,
-  "total_bytes": 80900
+  "total_floats": 44929,
+  "total_bytes": 179716
 }

@@ -195,25 +195,98 @@ def sample_batch(
     device: torch.device,
     target_source: str,
     target_volume: torch.Tensor | None,
+    baseline_scale: float,
+    importance_ratio: float,
+    importance_threshold: float,
+    importance_oversample: int,
+    importance_max_rounds: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    points = torch.rand(batch_size, 3, device=device) * 2.0 - 1.0
     if target_source == "torus":
+        points = torch.rand(batch_size, 3, device=device) * 2.0 - 1.0
         gt = torus_density(points)
     elif target_source == "volume":
         if target_volume is None:
             raise ValueError("target_volume must be provided when target_source='volume'")
+
+        guided_ratio = float(max(0.0, min(1.0, importance_ratio)))
+        guided_count = int(batch_size * guided_ratio)
+        uniform_count = batch_size - guided_count
+
+        point_chunks: List[torch.Tensor] = []
+        if uniform_count > 0:
+            point_chunks.append(torch.rand(uniform_count, 3, device=device) * 2.0 - 1.0)
+
+        if guided_count > 0:
+            selected_chunks: List[torch.Tensor] = []
+            selected_total = 0
+            rounds = 0
+            oversample = max(1, int(importance_oversample))
+            max_rounds = max(1, int(importance_max_rounds))
+            threshold = float(max(0.0, importance_threshold))
+
+            while selected_total < guided_count and rounds < max_rounds:
+                remaining = guided_count - selected_total
+                candidate_count = max(remaining * oversample, oversample)
+                candidates = torch.rand(candidate_count, 3, device=device) * 2.0 - 1.0
+                candidate_gt = sample_volume_trilinear(target_volume, candidates)
+                keep = candidates[candidate_gt > threshold]
+                if keep.shape[0] > 0:
+                    take = min(remaining, keep.shape[0])
+                    selected_chunks.append(keep[:take])
+                    selected_total += take
+                rounds += 1
+
+            if selected_total < guided_count:
+                fill = torch.rand(guided_count - selected_total, 3, device=device) * 2.0 - 1.0
+                selected_chunks.append(fill)
+
+            point_chunks.append(torch.cat(selected_chunks, dim=0))
+
+        points = torch.cat(point_chunks, dim=0)
+        if points.shape[0] != batch_size:
+            raise RuntimeError(f"sampled unexpected point count {points.shape[0]}, expected {batch_size}")
+
+        # Keep stochastic ordering to avoid chunk-order bias between uniform and guided subsets.
+        perm = torch.randperm(batch_size, device=device)
+        points = points[perm]
         gt = sample_volume_trilinear(target_volume, points)
     else:
         raise ValueError(f"unsupported target_source '{target_source}'")
-    baseline = box_density(points)
+    baseline = baseline_scale * box_density(points)
     residual = (gt - baseline).unsqueeze(-1)
     return points, residual
+
+
+def residual_loss_terms(
+    pred_residual: torch.Tensor,
+    target_residual: torch.Tensor,
+    abs_weight_scale: float,
+    l1_coeff: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    mse = F.mse_loss(pred_residual, target_residual)
+    weight = 1.0 + max(0.0, float(abs_weight_scale)) * torch.abs(target_residual)
+    weighted_mse = (weight * (pred_residual - target_residual).square()).mean()
+    l1 = F.l1_loss(pred_residual, target_residual)
+    objective = weighted_mse + max(0.0, float(l1_coeff)) * l1
+    return objective, mse, l1
+
+
+def gradient_regularization(
+    pred_residual: torch.Tensor,
+    points: torch.Tensor,
+    coeff: float,
+) -> torch.Tensor:
+    if coeff <= 0.0:
+        return pred_residual.new_zeros(())
+    grads = torch.autograd.grad(pred_residual.sum(), points, create_graph=True)[0]
+    return float(coeff) * grads.square().mean()
 
 
 def export_model(
     model: ResidualMLP,
     encoding_levels: int,
     ground_truth_info: Dict[str, Any],
+    baseline_scale: float,
     output_dir: Path,
     weights_name: str = "residual_mlp_weights.bin",
     meta_name: str = "residual_mlp_metadata.json",
@@ -266,6 +339,7 @@ def export_model(
             "type": "smooth_box",
             "half_extents": list(BOX_HALF_EXTENTS),
             "sharpness": BOX_SHARPNESS,
+            "scale": baseline_scale,
         },
         "ground_truth": ground_truth_info,
         "offsets": offsets,
@@ -309,11 +383,19 @@ def train(args: argparse.Namespace) -> None:
     if args.fourier_levels < 1:
         raise ValueError("fourier_levels must be >= 1 to enable positional encoding.")
     if len(args.hidden_layers) != 2:
-        raise ValueError("--hidden-layers must provide exactly 2 integers, e.g. --hidden-layers 128 128")
+        raise ValueError("--hidden-layers must provide exactly 2 integers, e.g. --hidden-layers 192 192")
     hidden0 = int(args.hidden_layers[0])
     hidden1 = int(args.hidden_layers[1])
     if hidden0 <= 0 or hidden1 <= 0:
         raise ValueError(f"--hidden-layers values must be > 0, got {args.hidden_layers}")
+    if args.baseline_scale <= 0:
+        raise ValueError(f"--baseline-scale must be > 0, got {args.baseline_scale}")
+    if args.grad_reg_coeff < 0:
+        raise ValueError(f"--grad-reg-coeff must be >= 0, got {args.grad_reg_coeff}")
+    if args.loss_weight_abs_scale < 0:
+        raise ValueError(f"--loss-weight-abs-scale must be >= 0, got {args.loss_weight_abs_scale}")
+    if args.loss_l1_coeff < 0:
+        raise ValueError(f"--loss-l1-coeff must be >= 0, got {args.loss_l1_coeff}")
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Device: {device}")
@@ -322,6 +404,20 @@ def train(args: argparse.Namespace) -> None:
         f"{args.fourier_levels}, order=input_xyz_then_per_level_sin_xyz_cos_xyz, freq=2**i (no 2pi)"
     )
     print(f"MLP hidden layers: [{hidden0}, {hidden1}]")
+    print(
+        "Sampling: "
+        f"importance_ratio={args.importance_ratio:.2f}, "
+        f"importance_threshold={args.importance_threshold:.3f}, "
+        f"importance_oversample={args.importance_oversample}, "
+        f"importance_max_rounds={args.importance_max_rounds}"
+    )
+    print(
+        "Loss: "
+        f"weighted_mse_abs_scale={args.loss_weight_abs_scale:.3f}, "
+        f"l1_coeff={args.loss_l1_coeff:.3f}, "
+        f"grad_reg_coeff={args.grad_reg_coeff:.6f}"
+    )
+    print(f"Baseline: smooth_box scale={args.baseline_scale:.3f}, sharpness={BOX_SHARPNESS:.3f}")
 
     target_source = str(args.target_source).strip().lower()
     target_volume: torch.Tensor | None = None
@@ -361,7 +457,7 @@ def train(args: argparse.Namespace) -> None:
     model = ResidualMLP(input_dim=encoder.output_dim, hidden_sizes=(hidden0, hidden1), output_dim=1).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    ema_loss = None
+    ema_mse = None
     stop_step = args.max_steps
 
     for step in range(1, args.max_steps + 1):
@@ -370,25 +466,49 @@ def train(args: argparse.Namespace) -> None:
             device=device,
             target_source=target_source,
             target_volume=target_volume,
+            baseline_scale=args.baseline_scale,
+            importance_ratio=args.importance_ratio,
+            importance_threshold=args.importance_threshold,
+            importance_oversample=args.importance_oversample,
+            importance_max_rounds=args.importance_max_rounds,
         )
+        points.requires_grad_(args.grad_reg_coeff > 0.0)
         encoded = encoder(points)
         pred_residual = model(encoded)
 
-        loss = F.mse_loss(pred_residual, target_residual)
+        data_objective, mse, l1 = residual_loss_terms(
+            pred_residual=pred_residual,
+            target_residual=target_residual,
+            abs_weight_scale=args.loss_weight_abs_scale,
+            l1_coeff=args.loss_l1_coeff,
+        )
+        grad_reg = gradient_regularization(
+            pred_residual=pred_residual,
+            points=points,
+            coeff=args.grad_reg_coeff,
+        )
+        objective = data_objective + grad_reg
 
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        objective.backward()
         optimizer.step()
 
-        loss_val = float(loss.item())
-        ema_loss = loss_val if ema_loss is None else (0.98 * ema_loss + 0.02 * loss_val)
+        objective_val = float(objective.item())
+        data_objective_val = float(data_objective.item())
+        grad_reg_val = float(grad_reg.item())
+        mse_val = float(mse.item())
+        l1_val = float(l1.item())
+        ema_mse = mse_val if ema_mse is None else (0.98 * ema_mse + 0.02 * mse_val)
 
         if step % args.log_every == 0 or step == 1:
-            print(f"step={step:6d}  loss={loss_val:.8f}  ema={ema_loss:.8f}")
+            print(
+                f"step={step:6d}  obj={objective_val:.8f}  data_obj={data_objective_val:.8f}  "
+                f"mse={mse_val:.8f}  l1={l1_val:.8f}  grad={grad_reg_val:.8f}  ema_mse={ema_mse:.8f}"
+            )
 
-        if step >= args.min_steps and ema_loss is not None and ema_loss <= args.target_mse:
+        if step >= args.min_steps and ema_mse is not None and ema_mse <= args.target_mse:
             stop_step = step
-            print(f"Early stop at step {step}: ema_loss={ema_loss:.8f} <= target_mse={args.target_mse:.8f}")
+            print(f"Early stop at step {step}: ema_mse={ema_mse:.8f} <= target_mse={args.target_mse:.8f}")
             break
 
     with torch.no_grad():
@@ -397,15 +517,31 @@ def train(args: argparse.Namespace) -> None:
             device=device,
             target_source=target_source,
             target_volume=target_volume,
+            baseline_scale=args.baseline_scale,
+            importance_ratio=args.importance_ratio,
+            importance_threshold=args.importance_threshold,
+            importance_oversample=args.importance_oversample,
+            importance_max_rounds=args.importance_max_rounds,
         )
         eval_pred = model(encoder(points))
-        eval_mse = F.mse_loss(eval_pred, target_residual).item()
-        print(f"final_eval_mse={eval_mse:.8f}  (trained_steps={stop_step})")
+        eval_objective, eval_mse, eval_l1 = residual_loss_terms(
+            pred_residual=eval_pred,
+            target_residual=target_residual,
+            abs_weight_scale=args.loss_weight_abs_scale,
+            l1_coeff=args.loss_l1_coeff,
+        )
+        print(
+            f"final_eval_obj={float(eval_objective.item()):.8f}  "
+            f"final_eval_mse={float(eval_mse.item()):.8f}  "
+            f"final_eval_l1={float(eval_l1.item()):.8f}  "
+            f"(trained_steps={stop_step})"
+        )
 
     export_model(
         model=model,
         encoding_levels=args.fourier_levels,
         ground_truth_info=ground_truth_info,
+        baseline_scale=args.baseline_scale,
         output_dir=Path(args.output_dir),
         weights_name=args.weights_name,
         meta_name=args.meta_name,
@@ -420,8 +556,10 @@ def train(args: argparse.Namespace) -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    repo_root = Path(__file__).resolve().parent.parent
+    train_dir = Path(__file__).resolve().parent
+    repo_root = train_dir.parent
     default_viz_dir = repo_root / "viz" / "public" / "mlp"
+    default_volume_bin = train_dir / "outputs" / "wdas_cloud_quarter_256.bin"
     p = argparse.ArgumentParser(description="Train residual MLP vs box baseline (torus or dense volume) and export flat weights.")
     p.add_argument("--output-dir", type=str, default="outputs")
     p.add_argument("--weights-name", type=str, default="residual_mlp_weights.bin")
@@ -442,21 +580,51 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-steps", type=int, default=12000)
     p.add_argument("--min-steps", type=int, default=500)
     p.add_argument("--target-mse", type=float, default=5e-5)
+    p.add_argument(
+        "--baseline-scale",
+        type=float,
+        default=0.8,
+        help="Scale factor applied to smooth box baseline before residual target computation.",
+    )
+    p.add_argument(
+        "--grad-reg-coeff",
+        type=float,
+        default=1e-3,
+        help="Coefficient for gradient regularization on d(pred_residual)/d(points). Set 0 to disable.",
+    )
+    p.add_argument(
+        "--loss-weight-abs-scale",
+        type=float,
+        default=4.0,
+        help="Weighted-MSE scale: weight = 1 + scale * abs(target_residual). Set 0 for unweighted MSE.",
+    )
+    p.add_argument(
+        "--loss-l1-coeff",
+        type=float,
+        default=0.2,
+        help="Additional L1 term coefficient in objective. Set 0 to disable.",
+    )
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--fourier-levels", type=int, default=4)
+    p.add_argument("--fourier-levels", type=int, default=6)
     p.add_argument(
         "--hidden-layers",
         type=int,
         nargs=2,
-        default=[128, 128],
+        default=[192, 192],
         metavar=("H0", "H1"),
-        help="Two hidden layer sizes for the residual MLP (default: 128 128).",
+        help="Two hidden layer sizes for the residual MLP (default: 192 192).",
     )
-    p.add_argument("--target-source", type=str, default="torus", choices=["torus", "volume"])
+    p.add_argument(
+        "--target-source",
+        type=str,
+        default="volume",
+        choices=["torus", "volume"],
+        help="Ground-truth source. Defaults to 'volume' using the quarter-resolution Disney cloud export.",
+    )
     p.add_argument(
         "--volume-bin",
         type=str,
-        default="",
+        default=str(default_volume_bin),
         help="Path to dense float32 volume binary [D,H,W] used when --target-source=volume.",
     )
     p.add_argument(
@@ -466,6 +634,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Optional path to JSON metadata with dims. Defaults to <volume-bin>.json.",
     )
     p.add_argument("--log-every", type=int, default=200)
+    p.add_argument(
+        "--importance-ratio",
+        type=float,
+        default=0.5,
+        help="Fraction of points sampled from non-empty regions for volume targets (0..1).",
+    )
+    p.add_argument(
+        "--importance-threshold",
+        type=float,
+        default=0.05,
+        help="Density threshold used to accept guided samples for volume targets.",
+    )
+    p.add_argument(
+        "--importance-oversample",
+        type=int,
+        default=4,
+        help="Candidate multiplier used during guided sample rejection sampling.",
+    )
+    p.add_argument(
+        "--importance-max-rounds",
+        type=int,
+        default=8,
+        help="Maximum rejection-sampling rounds when filling guided points.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="")
     return p
