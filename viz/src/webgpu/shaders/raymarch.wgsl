@@ -40,7 +40,9 @@ fn density(p: vec3f) -> f32 {
   if (any(uvw < vec3f(0.0)) || any(uvw > vec3f(1.0))) {
     return 0.0;
   }
-  return clamp(textureSampleLevel(volumeTex, volumeSampler, uvw, 0.0).r, 0.0, 1.0);
+  let dims = textureDimensions(volumeTex, 0);
+  let coord = min(vec3u(uvw * vec3f(dims)), dims - vec3u(1u));
+  return clamp(textureLoad(volumeTex, vec3i(coord), 0).r, 0.0, 1.0);
 }
 
 fn sampleSunTransmittance(p: vec3f) -> f32 {

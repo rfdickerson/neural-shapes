@@ -8,7 +8,6 @@ struct LightingParams {
 }
 
 @group(0) @binding(0) var densityVolume: texture_3d<f32>;
-@group(0) @binding(1) var volumeSampler: sampler;
 @group(0) @binding(2) var sunTransmittanceOut: texture_storage_3d<rgba16float, write>;
 @group(0) @binding(3) var<uniform> params: LightingParams;
 
@@ -29,7 +28,9 @@ fn sampleDensity(p: vec3f) -> f32 {
   if (any(uvw < vec3f(0.0)) || any(uvw > vec3f(1.0))) {
     return 0.0;
   }
-  return clamp(textureSampleLevel(densityVolume, volumeSampler, uvw, 0.0).r, 0.0, 1.0);
+  let dims = textureDimensions(densityVolume, 0);
+  let coord = min(vec3u(uvw * vec3f(dims)), dims - vec3u(1u));
+  return clamp(textureLoad(densityVolume, vec3i(coord), 0).r, 0.0, 1.0);
 }
 
 fn intersectAabb(rayOrigin: vec3f, rayDir: vec3f, bmin: vec3f, bmax: vec3f) -> vec2f {

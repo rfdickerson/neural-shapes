@@ -55,6 +55,20 @@ body,
   font: 500 12px/1.2 ui-sans-serif, system-ui, sans-serif;
 }
 
+.controls__toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #d7dbe5;
+  font: 600 12px/1.2 ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: 0.02em;
+  user-select: none;
+}
+
+.controls__toggle input[type="checkbox"] {
+  accent-color: #8fb9ff;
+}
+
 .controls__range {
   width: 140px;
 }

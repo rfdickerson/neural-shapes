@@ -21,9 +21,17 @@ struct MLPMetadata {
   _pad1: u32,
 }
 
+struct FillParams {
+  detailParams: vec4f, // x=scale, y=erosionStrength, z=edgeStart, w=edgeEnd
+  flags: vec4f, // x=enableDetail
+}
+
 @group(0) @binding(0) var volumeOut: texture_storage_3d<rgba16float, write>;
 @group(0) @binding(1) var<storage, read> mlpWeights: array<f16>;
 @group(0) @binding(2) var<uniform> mlpMeta: MLPMetadata;
+@group(0) @binding(3) var detailNoiseTex: texture_3d<f32>;
+@group(0) @binding(4) var detailNoiseSampler: sampler;
+@group(0) @binding(5) var<uniform> fillParams: FillParams;
 
 fn encodePosition(p: vec3<f32>) -> array<f32, ENCODED_DIM> {
   var out: array<f32, ENCODED_DIM>;
@@ -138,6 +146,26 @@ fn smoothBoxBaseline(p: vec3<f32>) -> f32 {
   return 1.0 / (1.0 + exp(BOX_SHARPNESS * sdf));
 }
 
+fn erodeWithDetail(rawDensity: f32, p: vec3<f32>) -> f32 {
+  if (fillParams.flags.x < 0.5) {
+    return rawDensity;
+  }
+  let detailScale = max(fillParams.detailParams.x, 0.001);
+  let erosionStrength = clamp(fillParams.detailParams.y, 0.0, 2.0);
+  let edgeStart = clamp(fillParams.detailParams.z, 0.0, 1.0);
+  let edgeEnd = clamp(fillParams.detailParams.w, edgeStart + 1.0e-4, 1.0);
+
+  let uvw = fract((p * 0.5 + vec3<f32>(0.5)) * detailScale);
+  let noise = textureSampleLevel(detailNoiseTex, detailNoiseSampler, uvw, 0.0);
+  let perlin = noise.r;
+  let worley = noise.g;
+  // Erode mostly near cloud boundaries, not dense core.
+  let edgeMask = 1.0 - smoothstep(edgeStart, edgeEnd, rawDensity);
+  let erosionNoise = mix(perlin, worley, 0.65);
+  let erosion = (1.0 - erosionNoise) * erosionStrength * edgeMask;
+  return max(rawDensity - erosion, 0.0);
+}
+
 @compute @workgroup_size(4, 4, 4)
 fn csMain(@builtin(global_invocation_id) id: vec3<u32>) {
   let dims = textureDimensions(volumeOut);
@@ -150,8 +178,9 @@ fn csMain(@builtin(global_invocation_id) id: vec3<u32>) {
 
   let macroDensity = smoothBoxBaseline(p);
   let residual = mlpResidual(p); // keep signed so negative values can carve holes
-  let rawDensity = clamp(macroDensity + residual, 0.0, 1.0);
-  let density = select(0.0, rawDensity, rawDensity >= DENSITY_WRITE_CUTOFF);
+  let baseDensity = clamp(macroDensity + residual, 0.0, 1.0);
+  let detailedDensity = erodeWithDetail(baseDensity, p);
+  let density = select(0.0, detailedDensity, detailedDensity >= DENSITY_WRITE_CUTOFF);
 
   textureStore(volumeOut, vec3<i32>(id), vec4f(density, 0.0, 0.0, 0.0));
 }

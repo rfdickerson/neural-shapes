@@ -7,6 +7,7 @@ const DEFAULT_SUN_AZIMUTH = 36;
 export class App {
   private readonly canvas: HTMLCanvasElement;
   private readonly modeSelect: HTMLSelectElement;
+  private readonly detailNoiseToggle: HTMLInputElement;
   private readonly densitySlider: HTMLInputElement;
   private readonly densityValue: HTMLSpanElement;
   private readonly sunPitchSlider: HTMLInputElement;
@@ -32,6 +33,19 @@ export class App {
       <option value="cloudSky">Cloud + Sky</option>
       <option value="fogOnly">Fog Only</option>
     `;
+
+    const detailToggleLabel = document.createElement("label");
+    detailToggleLabel.className = "controls__toggle";
+    detailToggleLabel.htmlFor = "detail-noise-toggle";
+
+    this.detailNoiseToggle = document.createElement("input");
+    this.detailNoiseToggle.id = "detail-noise-toggle";
+    this.detailNoiseToggle.type = "checkbox";
+    this.detailNoiseToggle.checked = true;
+
+    const detailToggleText = document.createElement("span");
+    detailToggleText.textContent = "Detail Noise";
+    detailToggleLabel.append(this.detailNoiseToggle, detailToggleText);
 
     const densityLabel = document.createElement("label");
     densityLabel.className = "controls__label";
@@ -90,6 +104,7 @@ export class App {
     controls.append(
       label,
       this.modeSelect,
+      detailToggleLabel,
       densityLabel,
       this.densitySlider,
       this.densityValue,
@@ -110,6 +125,10 @@ export class App {
     this.modeSelect.addEventListener("change", () => {
       const mode = this.modeSelect.value as RenderMode;
       this.renderer?.setRenderMode(mode);
+    });
+
+    this.detailNoiseToggle.addEventListener("change", () => {
+      this.renderer?.setDetailNoiseEnabled(this.detailNoiseToggle.checked);
     });
 
     this.densitySlider.addEventListener("input", () => {
@@ -134,6 +153,7 @@ export class App {
   async start(): Promise<void> {
     this.renderer = await WebGPURenderer.create(this.canvas);
     this.renderer.setRenderMode(this.modeSelect.value as RenderMode);
+    this.renderer.setDetailNoiseEnabled(this.detailNoiseToggle.checked);
     this.renderer.setCloudDensity(Number(this.densitySlider.value));
     this.renderer.setSunAngles(Number(this.sunPitchSlider.value), Number(this.sunAzimuthSlider.value));
     window.addEventListener("resize", this.handleResize);

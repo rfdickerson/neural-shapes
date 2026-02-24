@@ -5,7 +5,7 @@ import multiScatterSource from "./shaders/multiScatter.wgsl?raw";
 import type { OrbitCamera } from "./orbitCamera";
 
 const CAMERA_UNIFORM_BYTES = 96;
-const VOLUME_SIZE = 64;
+const VOLUME_SIZE = 128;
 const SHADER_MAX_INPUT_DIM = 27;
 const SHADER_MAX_HIDDEN = 64;
 const MLP_META_URL = "/mlp/residual_mlp_metadata.json";
@@ -18,6 +18,11 @@ const DEFAULT_ALBEDO = 0.92;
 const LIGHT_MARCH_STEPS = 96;
 const MULTISCATTER_ITERS = 8;
 const MULTISCATTER_LAMBDA = 0.58;
+const DETAIL_TEXTURE_SIZE = 64;
+const DETAIL_SCALE = 3.25;
+const DETAIL_EROSION_STRENGTH = 0.32;
+const DETAIL_EDGE_START = 0.08;
+const DETAIL_EDGE_END = 0.58;
 
 export type RenderMode = "cloudSky" | "fogOnly";
 
@@ -270,12 +275,177 @@ function createLightingParamsBufferData(
   return data;
 }
 
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+function smoothstep(edge0: number, edge1: number, x: number): number {
+  const denom = edge1 - edge0;
+  if (Math.abs(denom) < 1e-6) {
+    return x >= edge1 ? 1 : 0;
+  }
+  const t = clamp01((x - edge0) / denom);
+  return t * t * (3 - 2 * t);
+}
+
+function fract(value: number): number {
+  return value - Math.floor(value);
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+
+function wrapIndex(value: number, size: number): number {
+  const r = value % size;
+  return r < 0 ? r + size : r;
+}
+
+function hash3ToUnit(x: number, y: number, z: number, seed: number): number {
+  let h = (Math.imul(x, 374761393) ^ Math.imul(y, 668265263) ^ Math.imul(z, 2246822519) ^ seed) >>> 0;
+  h = (h ^ (h >>> 13)) >>> 0;
+  h = Math.imul(h, 1274126177) >>> 0;
+  h = (h ^ (h >>> 16)) >>> 0;
+  return h / 4294967295;
+}
+
+function valueNoise3D(x: number, y: number, z: number, period: number, seed: number): number {
+  const x0 = Math.floor(x);
+  const y0 = Math.floor(y);
+  const z0 = Math.floor(z);
+  const x1 = x0 + 1;
+  const y1 = y0 + 1;
+  const z1 = z0 + 1;
+  const tx = x - x0;
+  const ty = y - y0;
+  const tz = z - z0;
+  const ux = smoothstep(0, 1, tx);
+  const uy = smoothstep(0, 1, ty);
+  const uz = smoothstep(0, 1, tz);
+
+  const v000 = hash3ToUnit(wrapIndex(x0, period), wrapIndex(y0, period), wrapIndex(z0, period), seed);
+  const v100 = hash3ToUnit(wrapIndex(x1, period), wrapIndex(y0, period), wrapIndex(z0, period), seed);
+  const v010 = hash3ToUnit(wrapIndex(x0, period), wrapIndex(y1, period), wrapIndex(z0, period), seed);
+  const v110 = hash3ToUnit(wrapIndex(x1, period), wrapIndex(y1, period), wrapIndex(z0, period), seed);
+  const v001 = hash3ToUnit(wrapIndex(x0, period), wrapIndex(y0, period), wrapIndex(z1, period), seed);
+  const v101 = hash3ToUnit(wrapIndex(x1, period), wrapIndex(y0, period), wrapIndex(z1, period), seed);
+  const v011 = hash3ToUnit(wrapIndex(x0, period), wrapIndex(y1, period), wrapIndex(z1, period), seed);
+  const v111 = hash3ToUnit(wrapIndex(x1, period), wrapIndex(y1, period), wrapIndex(z1, period), seed);
+
+  const x00 = lerp(v000, v100, ux);
+  const x10 = lerp(v010, v110, ux);
+  const x01 = lerp(v001, v101, ux);
+  const x11 = lerp(v011, v111, ux);
+  const y0v = lerp(x00, x10, uy);
+  const y1v = lerp(x01, x11, uy);
+  return lerp(y0v, y1v, uz);
+}
+
+function fbmTileable(x: number, y: number, z: number, basePeriod: number): number {
+  let sum = 0;
+  let norm = 0;
+  let amplitude = 0.5;
+  for (let octave = 0; octave < 4; octave++) {
+    const frequency = 1 << octave;
+    const period = basePeriod * frequency;
+    sum += amplitude * valueNoise3D(x * frequency, y * frequency, z * frequency, period, 1337 + octave * 911);
+    norm += amplitude;
+    amplitude *= 0.5;
+  }
+  return norm > 0 ? sum / norm : 0;
+}
+
+function worleyF1Tileable(ux: number, uy: number, uz: number, cellCount: number): number {
+  const px = ux * cellCount;
+  const py = uy * cellCount;
+  const pz = uz * cellCount;
+  const baseX = Math.floor(px);
+  const baseY = Math.floor(py);
+  const baseZ = Math.floor(pz);
+  let minDistSq = 1e9;
+
+  for (let dz = -1; dz <= 1; dz++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const cx = baseX + dx;
+        const cy = baseY + dy;
+        const cz = baseZ + dz;
+        const wx = wrapIndex(cx, cellCount);
+        const wy = wrapIndex(cy, cellCount);
+        const wz = wrapIndex(cz, cellCount);
+        const fx = hash3ToUnit(wx, wy, wz, 401);
+        const fy = hash3ToUnit(wx, wy, wz, 997);
+        const fz = hash3ToUnit(wx, wy, wz, 1597);
+        const sx = cx + fx;
+        const sy = cy + fy;
+        const sz = cz + fz;
+        const dxp = sx - px;
+        const dyp = sy - py;
+        const dzp = sz - pz;
+        const distSq = dxp * dxp + dyp * dyp + dzp * dzp;
+        if (distSq < minDistSq) {
+          minDistSq = distSq;
+        }
+      }
+    }
+  }
+
+  return Math.sqrt(minDistSq);
+}
+
+function createDetailNoiseVolumeData(size: number): Uint8Array<ArrayBuffer> {
+  const voxelCount = size * size * size;
+  const data = new Uint8Array<ArrayBuffer>(new ArrayBuffer(voxelCount * 4));
+  const perlinPeriod = 8;
+  const worleyCells = 7;
+  let index = 0;
+
+  for (let z = 0; z < size; z++) {
+    const uz = (z + 0.5) / size;
+    for (let y = 0; y < size; y++) {
+      const uy = (y + 0.5) / size;
+      for (let x = 0; x < size; x++) {
+        const ux = (x + 0.5) / size;
+
+        const perlin = fbmTileable(ux * perlinPeriod, uy * perlinPeriod, uz * perlinPeriod, perlinPeriod);
+        const perlinShaped = smoothstep(0.22, 0.82, perlin);
+
+        const f1 = worleyF1Tileable(ux, uy, uz, worleyCells);
+        const worley = 1.0 - clamp01(f1 / 1.7320508075688772);
+        const worleyShaped = smoothstep(0.08, 0.92, worley);
+
+        data[index++] = Math.round(clamp01(perlinShaped) * 255);
+        data[index++] = Math.round(clamp01(worleyShaped) * 255);
+        data[index++] = 0;
+        data[index++] = 255;
+      }
+    }
+  }
+
+  return data;
+}
+
+function createFillParamsBufferData(enableDetail: boolean): Float32Array<ArrayBuffer> {
+  const data = new Float32Array<ArrayBuffer>(new ArrayBuffer(8 * 4)); // 2 vec4
+  data[0] = DETAIL_SCALE;
+  data[1] = DETAIL_EROSION_STRENGTH;
+  data[2] = DETAIL_EDGE_START;
+  data[3] = DETAIL_EDGE_END;
+  data[4] = enableDetail ? 1 : 0;
+  data[5] = 0;
+  data[6] = 0;
+  data[7] = 0;
+  return data;
+}
+
 export class WebGPURenderer {
   private renderMode: RenderMode = "cloudSky";
   private sigma = DEFAULT_SIGMA;
   private readonly phaseG = DEFAULT_PHASE_G;
   private readonly sunIntensity = DEFAULT_SUN_INTENSITY;
   private sunDirection = normalize3(0.5, 0.78, 0.37);
+  private detailNoiseEnabled = true;
+  private volumeDirty = false;
   private lightingDirty = false;
 
   private constructor(
@@ -285,6 +455,10 @@ export class WebGPURenderer {
     private readonly pipeline: GPURenderPipeline,
     private readonly bindGroup: GPUBindGroup,
     private readonly cameraBuffer: GPUBuffer,
+    private readonly fillPipeline: GPUComputePipeline,
+    private readonly fillBindGroup: GPUBindGroup,
+    private readonly fillParamsBuffer: GPUBuffer,
+    private readonly fillParamsData: Float32Array<ArrayBuffer>,
     private readonly sunTransmittancePipeline: GPUComputePipeline,
     private readonly sunTransmittanceBindGroup: GPUBindGroup,
     private readonly multiScatterPipeline: GPUComputePipeline,
@@ -410,6 +584,47 @@ export class WebGPURenderer {
       addressModeW: "clamp-to-edge"
     });
 
+    const detailNoiseData = createDetailNoiseVolumeData(DETAIL_TEXTURE_SIZE);
+    const detailNoiseTexture = device.createTexture({
+      size: {
+        width: DETAIL_TEXTURE_SIZE,
+        height: DETAIL_TEXTURE_SIZE,
+        depthOrArrayLayers: DETAIL_TEXTURE_SIZE
+      },
+      dimension: "3d",
+      format: "rgba8unorm",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+    });
+    device.queue.writeTexture(
+      { texture: detailNoiseTexture },
+      detailNoiseData,
+      {
+        bytesPerRow: DETAIL_TEXTURE_SIZE * 4,
+        rowsPerImage: DETAIL_TEXTURE_SIZE
+      },
+      {
+        width: DETAIL_TEXTURE_SIZE,
+        height: DETAIL_TEXTURE_SIZE,
+        depthOrArrayLayers: DETAIL_TEXTURE_SIZE
+      }
+    );
+    const detailNoiseView = detailNoiseTexture.createView({ dimension: "3d" });
+    const detailNoiseSampler = device.createSampler({
+      magFilter: "linear",
+      minFilter: "linear",
+      mipmapFilter: "linear",
+      addressModeU: "repeat",
+      addressModeV: "repeat",
+      addressModeW: "repeat"
+    });
+
+    const fillParamsData = createFillParamsBufferData(true);
+    const fillParamsBuffer = device.createBuffer({
+      size: fillParamsData.byteLength,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+    });
+    device.queue.writeBuffer(fillParamsBuffer, 0, fillParamsData);
+
     const lightingStepDistance = 2.0 / VOLUME_SIZE;
     const sunPassParamsData = createLightingParamsBufferData(
       normalize3(0.5, 0.78, 0.37),
@@ -466,6 +681,18 @@ export class WebGPURenderer {
         {
           binding: 2,
           resource: { buffer: mlpMetaBuffer }
+        },
+        {
+          binding: 3,
+          resource: detailNoiseView
+        },
+        {
+          binding: 4,
+          resource: detailNoiseSampler
+        },
+        {
+          binding: 5,
+          resource: { buffer: fillParamsBuffer }
         }
       ]
     });
@@ -483,10 +710,6 @@ export class WebGPURenderer {
         {
           binding: 0,
           resource: volumeView
-        },
-        {
-          binding: 1,
-          resource: volumeSampler
         },
         {
           binding: 2,
@@ -692,6 +915,10 @@ export class WebGPURenderer {
       pipeline,
       bindGroup,
       cameraBuffer,
+      fillPipeline,
+      fillBindGroup,
+      fillParamsBuffer,
+      fillParamsData,
       sunTransmittancePipeline,
       sunTransmittanceBindGroup,
       multiScatterPipeline,
@@ -716,6 +943,15 @@ export class WebGPURenderer {
     this.lightingDirty = true;
   }
 
+  setDetailNoiseEnabled(enabled: boolean): void {
+    const next = Boolean(enabled);
+    if (this.detailNoiseEnabled === next) {
+      return;
+    }
+    this.detailNoiseEnabled = next;
+    this.volumeDirty = true;
+  }
+
   setSunAngles(pitchDegrees: number, azimuthDegrees: number): void {
     if (!Number.isFinite(pitchDegrees) || !Number.isFinite(azimuthDegrees)) {
       return;
@@ -729,6 +965,22 @@ export class WebGPURenderer {
       cosPitch * Math.sin(azimuth)
     );
     this.lightingDirty = true;
+  }
+
+  private updateVolumePrecompute(): void {
+    this.fillParamsData[4] = this.detailNoiseEnabled ? 1 : 0;
+    this.device.queue.writeBuffer(this.fillParamsBuffer, 0, this.fillParamsData);
+
+    const fillEncoder = this.device.createCommandEncoder();
+    const fillPass = fillEncoder.beginComputePass();
+    fillPass.setPipeline(this.fillPipeline);
+    fillPass.setBindGroup(0, this.fillBindGroup);
+    fillPass.dispatchWorkgroups(VOLUME_SIZE / 4, VOLUME_SIZE / 4, VOLUME_SIZE / 4);
+    fillPass.end();
+    this.device.queue.submit([fillEncoder.finish()]);
+
+    this.updateLightingPrecompute();
+    this.volumeDirty = false;
   }
 
   private updateLightingPrecompute(): void {
@@ -780,7 +1032,9 @@ export class WebGPURenderer {
   }
 
   render(camera: OrbitCamera): void {
-    if (this.lightingDirty) {
+    if (this.volumeDirty) {
+      this.updateVolumePrecompute();
+    } else if (this.lightingDirty) {
       this.updateLightingPrecompute();
     }
 

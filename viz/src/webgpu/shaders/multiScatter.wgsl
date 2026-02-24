@@ -26,7 +26,9 @@ fn csMain(@builtin(global_invocation_id) id: vec3u) {
   }
 
   let uvw = (vec3f(id) + vec3f(0.5)) / vec3f(dim);
-  let density = clamp(textureSampleLevel(densityVolume, volumeSampler, uvw, 0.0).r, 0.0, 1.0);
+  let densityDims = textureDimensions(densityVolume, 0);
+  let densityCoord = min(vec3u(uvw * vec3f(densityDims)), densityDims - vec3u(1u));
+  let density = clamp(textureLoad(densityVolume, vec3i(densityCoord), 0).r, 0.0, 1.0);
   let sunTr = clamp(textureSampleLevel(sunTransmittanceVolume, volumeSampler, uvw, 0.0).r, 0.0, 1.0);
 
   let densityScale = max(params.mediumParams.x, 0.01);
