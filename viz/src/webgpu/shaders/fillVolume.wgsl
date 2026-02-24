@@ -2,6 +2,9 @@ enable f16;
 
 const ENCODED_DIM = 39u;
 const MAX_HIDDEN = 256u;
+const EDGE_RECON_MIN = 0.035;
+const EDGE_RECON_MAX = 0.42;
+const EDGE_SUBVOXEL_SCALE = 0.35;
 
 struct MLPMetadata {
   inputDim: u32,
@@ -141,6 +144,12 @@ fn smoothBoxBaseline(p: vec3<f32>) -> f32 {
   return 1.0 / (1.0 + exp(fillParams.params.x * sdf));
 }
 
+fn evalRawDensity(p: vec3<f32>) -> f32 {
+  let macroDensity = fillParams.params.w * smoothBoxBaseline(p);
+  let residual = mlpResidual(p); // keep signed so negative values can carve holes
+  return clamp(macroDensity + residual, 0.0, 1.0);
+}
+
 @compute @workgroup_size(4, 4, 4)
 fn csMain(@builtin(global_invocation_id) id: vec3<u32>) {
   let dims = textureDimensions(volumeOut);
@@ -150,10 +159,22 @@ fn csMain(@builtin(global_invocation_id) id: vec3<u32>) {
 
   let uvw = vec3<f32>(id) / vec3<f32>(dims - 1u);
   let p = uvw * 2.0 - 1.0;
+  var rawDensity = evalRawDensity(p);
 
-  let macroDensity = fillParams.params.w * smoothBoxBaseline(p);
-  let residual = mlpResidual(p); // keep signed so negative values can carve holes
-  let rawDensity = clamp(macroDensity + residual, 0.0, 1.0);
+  // Spend extra MLP work only around the boundary shell where voxel quantization is most visible.
+  if (rawDensity > EDGE_RECON_MIN && rawDensity < EDGE_RECON_MAX) {
+    let voxelSpan = (vec3<f32>(2.0) / vec3<f32>(dims - 1u)) * EDGE_SUBVOXEL_SCALE;
+    let o0 = vec3<f32>( voxelSpan.x,  voxelSpan.y,  voxelSpan.z);
+    let o1 = vec3<f32>( voxelSpan.x, -voxelSpan.y, -voxelSpan.z);
+    let o2 = vec3<f32>(-voxelSpan.x,  voxelSpan.y, -voxelSpan.z);
+    let o3 = vec3<f32>(-voxelSpan.x, -voxelSpan.y,  voxelSpan.z);
+    let p0 = clamp(p + o0, vec3<f32>(-1.0), vec3<f32>(1.0));
+    let p1 = clamp(p + o1, vec3<f32>(-1.0), vec3<f32>(1.0));
+    let p2 = clamp(p + o2, vec3<f32>(-1.0), vec3<f32>(1.0));
+    let p3 = clamp(p + o3, vec3<f32>(-1.0), vec3<f32>(1.0));
+    rawDensity = (rawDensity + evalRawDensity(p0) + evalRawDensity(p1) + evalRawDensity(p2) + evalRawDensity(p3)) * 0.2;
+  }
+
   let floor = clamp(fillParams.params.y, 0.0, 1.0);
   let knee = max(fillParams.params.z, 1.0e-4);
   let gate = smoothstep(floor, floor + knee, rawDensity);

@@ -19,11 +19,6 @@ const kCloudWorldMin = -kCloudWorldHalfExtents;
 const kCloudWorldMax = kCloudWorldHalfExtents;
 const ENCODED_DIM = 39u;
 const MAX_HIDDEN = 256u;
-const ISO_ENTRY_THRESHOLD = 0.08;
-const SHELL_BAND_MIN = 0.03;
-const SHELL_BAND_MAX = 0.72;
-const NEURAL_SHELL_DECAY = 0.35;
-const NEURAL_RAY_FRACTION = 0.45;
 
 struct MLPMetadata {
   inputDim: u32,
@@ -287,7 +282,6 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
   let modeFlag = camera.renderParams.x;
   let sigma = max(camera.renderParams.y, 0.01);
   let basePhaseG = clamp(camera.renderParams.z, 0.0, 0.95);
-  let useNeuralRefine = camera.renderParams.w > 0.5;
   let sunDir = normalize(camera.sunDirectionIntensity.xyz);
   let sunIntensity = max(camera.sunDirectionIntensity.w, 0.01);
 
@@ -333,11 +327,6 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
   let ambientSky = skyColor(vec3f(0.0, 1.0, 0.0), sunDir, sunIntensity);
   let ambientBase = mix(vec3f(0.08, 0.10, 0.14), vec3f(0.18, 0.10, 0.16), sunset);
   let ambientTerm = mix(ambientBase, ambientSky, 0.35) * cloudAlbedo;
-  let allowNeuralRay = noiseSample.b < NEURAL_RAY_FRACTION;
-  var prevDensity = 0.0;
-  var boundaryRefined = false;
-  var boundaryScale = 1.0;
-  var boundaryAnchor = -1.0;
 
   var t = tStart + jitterFactor * stepSize;
   for (var i = 0u; i < maxSteps; i++) {
@@ -354,35 +343,10 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
     let pMid = camPos + rayDir * (t + localStep * 0.5);
     let dMid = densityTexture(pMid);
     if (dMid <= 1e-4) {
-      prevDensity = 0.0;
       t += localStep;
       continue;
     }
-    var refinedDensity = dMid;
-    let crossingIso = prevDensity < ISO_ENTRY_THRESHOLD && dMid >= ISO_ENTRY_THRESHOLD;
-    if (useNeuralRefine && allowNeuralRay && !boundaryRefined && crossingIso && transmittance > 0.05) {
-      let pLocal = worldToLocal(pMid);
-      let macroDensity = fillParams.params.w * smoothBoxBaseline(pLocal);
-      let residual = mlpResidual(pLocal);
-      let neuralRaw = clamp(macroDensity + residual, 0.0, 1.0);
-      let floor = clamp(fillParams.params.y, 0.0, 1.0);
-      let knee = max(fillParams.params.z, 1.0e-4);
-      let gate = smoothstep(floor, floor + knee, neuralRaw);
-      let neuralDensity = neuralRaw * gate;
-      boundaryScale = clamp(neuralDensity / max(dMid, 1.0e-3), 0.65, 1.5);
-      boundaryAnchor = t;
-      boundaryRefined = true;
-    }
-    if (boundaryRefined) {
-      let shellIn = smoothstep(SHELL_BAND_MIN, 0.22, dMid);
-      let shellOut = 1.0 - smoothstep(0.36, SHELL_BAND_MAX, dMid);
-      let shellBand = clamp(shellIn * shellOut, 0.0, 1.0);
-      let distSteps = abs(t - boundaryAnchor) / max(stepSize, 1.0e-4);
-      let shellFade = exp(-distSteps * NEURAL_SHELL_DECAY);
-      let shellWeight = shellBand * shellFade;
-      refinedDensity = clamp(mix(dMid, dMid * boundaryScale, shellWeight), 0.0, 1.0);
-    }
-    let densityShaped = mix(refinedDensity, smoothstep(0.02, 0.50, refinedDensity), 0.35);
+    let densityShaped = mix(dMid, smoothstep(0.02, 0.50, dMid), 0.35);
     let sigmaT = densityShaped * sigma;
     let segmentTransmittance = exp(-sigmaT * localStep);
     let contrib = transmittance * (1.0 - segmentTransmittance);
@@ -398,7 +362,6 @@ fn fsMain(in: VSOut) -> @location(0) vec4f {
       accum += contrib;
     }
     transmittance *= segmentTransmittance;
-    prevDensity = dMid;
     t += localStep;
   }
 
