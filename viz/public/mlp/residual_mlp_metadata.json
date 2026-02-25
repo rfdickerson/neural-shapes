@@ -4,22 +4,28 @@
   "residual_representation": "levelset",
   "encoding": {
     "type": "fourier",
-    "levels": 6,
+    "levels": 8,
     "include_input": true,
     "frequency_base": 2.0,
     "uses_two_pi": false,
     "ordering": "input_xyz_then_per_level_sin_xyz_cos_xyz",
     "axis_order": "xyz",
     "input_dims": 3,
-    "encoded_dims": 39
+    "encoded_dims": 51
   },
   "network": {
     "layers": [
-      39,
+      51,
       128,
       128,
-      1
+      2
     ]
+  },
+  "residual_decomposition": {
+    "type": "two_channel_additive",
+    "channels": 2,
+    "low_scale": 0.5,
+    "high_scale": 0.15
   },
   "baseline": {
     "type": "sdf_box",
@@ -35,7 +41,7 @@
   "reconstruction": {
     "type": "sigmoid_levelset",
     "iso_value": 0.1,
-    "decode_k": 16.0,
+    "decode_k": 32.0,
     "density_epsilon": 0.001
   },
   "ground_truth": {
@@ -87,8 +93,11 @@
     "training_focus": {
       "type": "iso_surface_shell",
       "target_field": "levelset",
-      "levelset_decode_k": 16.0,
+      "levelset_decode_k": 32.0,
       "levelset_density_eps": 0.001,
+      "residual_channels": 2,
+      "residual_low_scale": 0.5,
+      "residual_high_scale": 0.15,
       "iso_value": 0.1,
       "iso_band": 0.05,
       "iso_shell_ratio": 0.35,
@@ -96,30 +105,31 @@
       "surface_band_min": 0.05,
       "surface_band_max": 0.3,
       "iso_loss_weight": 3.0,
+      "loss_high_surface_weight": 1.0,
       "empty_density_threshold": 0.02,
       "empty_space_loss_weight": 1.0
     }
   },
   "offsets": {
     "W0": 0,
-    "b0": 4992,
-    "W1": 5120,
-    "b1": 21504,
-    "W2": 21632,
-    "b2": 21760
+    "b0": 6528,
+    "W1": 6656,
+    "b1": 23040,
+    "W2": 23168,
+    "b2": 23424
   },
   "counts": {
-    "W0": 4992,
+    "W0": 6528,
     "b0": 128,
     "W1": 16384,
     "b1": 128,
-    "W2": 128,
-    "b2": 1
+    "W2": 256,
+    "b2": 2
   },
   "shapes": {
     "W0": [
       128,
-      39
+      51
     ],
     "b0": [
       128
@@ -132,13 +142,13 @@
       128
     ],
     "W2": [
-      1,
+      2,
       128
     ],
     "b2": [
-      1
+      2
     ]
   },
-  "total_floats": 21761,
-  "total_bytes": 87044
+  "total_floats": 23426,
+  "total_bytes": 93704
 }

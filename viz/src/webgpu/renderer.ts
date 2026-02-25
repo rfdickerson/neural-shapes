@@ -6,7 +6,7 @@ import type { OrbitCamera } from "./orbitCamera";
 
 const CAMERA_UNIFORM_BYTES = 96;
 const VOLUME_SIZE = 128;
-const SHADER_MAX_INPUT_DIM = 39;
+const SHADER_MAX_INPUT_DIM = 51;
 const SHADER_MAX_HIDDEN = 256;
 const MLP_META_URL = "/mlp/residual_mlp_metadata.json";
 const MLP_WEIGHTS_URL = "/mlp/residual_mlp_weights.bin";
@@ -22,6 +22,7 @@ const LIGHT_MARCH_STEPS = 96;
 const MULTISCATTER_ITERS = 8;
 const MULTISCATTER_LAMBDA = 0.58;
 const DEFAULT_RECON_NOISE_FLOOR = 0.02;
+const MAX_RECON_NOISE_FLOOR = 0.8;
 const RECON_NOISE_KNEE = 0.03;
 const DEFAULT_BASELINE_HALF_EXTENTS: [number, number, number] = [0.6, 0.25, 0.6];
 const DEFAULT_BASELINE_SHARPNESS = 14.0;
@@ -60,6 +61,12 @@ interface ExportMetadata {
     iso_value?: number;
     decode_k?: number;
     density_epsilon?: number;
+  };
+  residual_decomposition?: {
+    type?: string;
+    channels?: number;
+    low_scale?: number;
+    high_scale?: number;
   };
   offsets: Record<string, number>;
   total_floats: number;
@@ -187,8 +194,8 @@ async function loadExportedMlpData(): Promise<LoadedMlpData> {
   if (fourierLevels < 1) {
     throw new Error(`Renderer requires fourierLevels >= 1, got ${fourierLevels}.`);
   }
-  if (fourierLevels > 6) {
-    throw new Error(`fourierLevels=${fourierLevels} exceeds shader max 6.`);
+  if (fourierLevels > 8) {
+    throw new Error(`fourierLevels=${fourierLevels} exceeds shader max 8.`);
   }
   const expectedEncodedDims = 3 + 6 * fourierLevels;
   if (encodedDims !== expectedEncodedDims) {
@@ -197,8 +204,8 @@ async function loadExportedMlpData(): Promise<LoadedMlpData> {
     );
   }
 
-  if (outputDim !== 1) {
-    throw new Error(`Expected output_dim=1, got ${outputDim}.`);
+  if (outputDim < 1 || outputDim > 2) {
+    throw new Error(`Expected output_dim in [1,2], got ${outputDim}.`);
   }
   if (inputDim !== encodedDims) {
     throw new Error(`Input dim mismatch: network input ${inputDim}, encoded dims ${encodedDims}.`);
@@ -251,7 +258,7 @@ async function loadExportedMlpData(): Promise<LoadedMlpData> {
   metaUniform[7] = w2Offset;
   metaUniform[8] = b2Offset;
   metaUniform[9] = fourierLevels;
-  metaUniform[10] = 0;
+  metaUniform[10] = outputDim;
   metaUniform[11] = 0;
 
   let baselineHalfExtents = DEFAULT_BASELINE_HALF_EXTENTS;
@@ -286,6 +293,37 @@ async function loadExportedMlpData(): Promise<LoadedMlpData> {
       ? "levelset"
       : "density";
   const representationMode = residualRepresentation === "levelset" ? 1 : 0;
+  const decomp = meta.residual_decomposition;
+  if (decomp?.channels !== undefined) {
+    const decChannels = Math.trunc(decomp.channels);
+    if (decChannels !== outputDim) {
+      throw new Error(
+        `MLP metadata residual_decomposition.channels=${decChannels} does not match network output_dim=${outputDim}.`
+      );
+    }
+  }
+  const lowScaleRaw = decomp?.low_scale;
+  const lowScale =
+    lowScaleRaw === undefined
+      ? outputDim > 1
+        ? 0.5
+        : 1.0
+      : Number.isFinite(lowScaleRaw) && lowScaleRaw > 0
+        ? lowScaleRaw
+        : (() => {
+            throw new Error("MLP metadata residual_decomposition.low_scale must be a positive number.");
+          })();
+  const highScaleRaw = decomp?.high_scale;
+  const highScale =
+    highScaleRaw === undefined
+      ? outputDim > 1
+        ? 0.15
+        : 0.0
+      : Number.isFinite(highScaleRaw) && highScaleRaw >= 0
+        ? highScaleRaw
+        : (() => {
+            throw new Error("MLP metadata residual_decomposition.high_scale must be a non-negative number.");
+          })();
   const levelsetDecodeKRaw = meta.reconstruction?.decode_k;
   const levelsetDecodeK =
     levelsetDecodeKRaw === undefined
@@ -312,7 +350,9 @@ async function loadExportedMlpData(): Promise<LoadedMlpData> {
     baselineScale,
     representationMode,
     levelsetDecodeK,
-    levelsetIsoValue
+    levelsetIsoValue,
+    lowScale,
+    highScale
   );
 
   return { weightsFp16, metaUniform, fillParamsUniform };
@@ -467,9 +507,11 @@ function createReconstructionParamsBufferData(
   baselineScale: number,
   representationMode: number,
   levelsetDecodeK: number,
-  levelsetIsoValue: number
+  levelsetIsoValue: number,
+  residualLowScale: number,
+  residualHighScale: number
 ): Float32Array<ArrayBuffer> {
-  const data = new Float32Array<ArrayBuffer>(new ArrayBuffer(12 * 4)); // 3 vec4
+  const data = new Float32Array<ArrayBuffer>(new ArrayBuffer(16 * 4)); // 4 vec4
   const iso = Math.max(1e-6, Math.min(levelsetIsoValue, 1.0 - 1e-6));
   const isoLogit = Math.log(iso / (1.0 - iso));
   data[0] = baselineHalfExtents[0];
@@ -483,7 +525,11 @@ function createReconstructionParamsBufferData(
   data[8] = levelsetDecodeK;
   data[9] = isoLogit;
   data[10] = iso;
-  data[11] = 0;
+  data[11] = residualLowScale;
+  data[12] = residualHighScale;
+  data[13] = 0;
+  data[14] = 0;
+  data[15] = 0;
   return data;
 }
 
@@ -1036,7 +1082,7 @@ export class WebGPURenderer {
     if (!Number.isFinite(value)) {
       return;
     }
-    const next = Math.max(0.0, Math.min(value, 0.35));
+    const next = Math.max(0.0, Math.min(value, MAX_RECON_NOISE_FLOOR));
     if (Math.abs(this.reconstructionNoiseFloor - next) < 1e-5) {
       return;
     }

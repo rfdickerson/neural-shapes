@@ -85,8 +85,8 @@ export class App {
     this.noiseFloorSlider.className = "controls__range";
     this.noiseFloorSlider.type = "range";
     this.noiseFloorSlider.min = "0.00";
-    this.noiseFloorSlider.max = "0.20";
-    this.noiseFloorSlider.step = "0.002";
+    this.noiseFloorSlider.max = "0.80";
+    this.noiseFloorSlider.step = "0.005";
     this.noiseFloorSlider.value = DEFAULT_NOISE_FLOOR.toFixed(3);
 
     this.noiseFloorValue = document.createElement("span");
@@ -179,12 +179,17 @@ export class App {
       this.needsRender = true;
     });
 
+    const applyNoiseFloor = () => {
+      const value = Number(this.noiseFloorSlider.value);
+      this.renderer?.setReconstructionNoiseFloor(value);
+      this.needsRender = true;
+    };
     this.noiseFloorSlider.addEventListener("input", () => {
       const value = Number(this.noiseFloorSlider.value);
       this.noiseFloorValue.textContent = value.toFixed(3);
-      this.renderer?.setReconstructionNoiseFloor(value);
-      this.needsRender = true;
     });
+    // Applying noise-floor rebuilds volume + lighting; commit on release to avoid expensive per-step updates.
+    this.noiseFloorSlider.addEventListener("change", applyNoiseFloor);
 
     this.sunPitchSlider.addEventListener("input", () => {
       const pitch = Number(this.sunPitchSlider.value);

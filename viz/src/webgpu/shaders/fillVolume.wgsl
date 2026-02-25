@@ -1,6 +1,6 @@
 enable f16;
 
-const ENCODED_DIM = 39u;
+const ENCODED_DIM = 51u;
 const MAX_HIDDEN = 256u;
 const EDGE_RECON_MIN = 0.035;
 const EDGE_RECON_MAX = 0.42;
@@ -17,14 +17,15 @@ struct MLPMetadata {
   w2Offset: u32,
   b2Offset: u32,
   fourierLevels: u32,
+  outputDim: u32,
   _pad0: u32,
-  _pad1: u32,
 }
 
 struct FillParams {
   baselineHalfExtents: vec4<f32>, // xyz = half extents, w = baseline scale
   params0: vec4<f32>, // x=baseline sharpness, y=noise floor, z=soft knee width, w=representation mode
-  params1: vec4<f32>, // x=levelset decode k, y=iso logit, z=iso value, w=reserved
+  params1: vec4<f32>, // x=levelset decode k, y=iso logit, z=iso value, w=low residual scale
+  params2: vec4<f32>, // x=high residual scale, yzw=reserved
 }
 
 @group(0) @binding(0) var volumeOut: texture_storage_3d<rgba16float, write>;
@@ -107,7 +108,7 @@ fn linearFromHidden(
   return out;
 }
 
-fn mlpResidual(p: vec3<f32>) -> f32 {
+fn mlpResidualTerms(p: vec3<f32>) -> vec2<f32> {
   let encoded = encodePosition(p);
   let h0 = linearFromEncoded(
     encoded,
@@ -124,13 +125,23 @@ fn mlpResidual(p: vec3<f32>) -> f32 {
     mlpMeta.b1Offset
   );
 
-  var sum = f32(mlpWeights[mlpMeta.b2Offset]);
+  let outDim = max(1u, mlpMeta.outputDim);
+  let rowStride = mlpMeta.hidden1;
+  var sum0 = f32(mlpWeights[mlpMeta.b2Offset]);
+  var sum1 = 0.0;
+  if (outDim > 1u) {
+    sum1 = f32(mlpWeights[mlpMeta.b2Offset + 1u]);
+  }
   for (var i = 0u; i < mlpMeta.hidden1; i++) {
-    let w = f32(mlpWeights[mlpMeta.w2Offset + i]);
-    sum += w * h1[i];
+    let w0 = f32(mlpWeights[mlpMeta.w2Offset + i]);
+    sum0 += w0 * h1[i];
+    if (outDim > 1u) {
+      let w1 = f32(mlpWeights[mlpMeta.w2Offset + rowStride + i]);
+      sum1 += w1 * h1[i];
+    }
   }
 
-  return sum;
+  return vec2<f32>(sum0, sum1);
 }
 
 fn sdBox(p: vec3<f32>, halfExtents: vec3<f32>) -> f32 {
@@ -145,19 +156,16 @@ fn smoothBoxBaseline(p: vec3<f32>) -> f32 {
   return 1.0 / (1.0 + exp(fillParams.params0.x * sdf));
 }
 
-fn densityToPhi(density: f32, decodeK: f32, isoLogit: f32) -> f32 {
-  let d = clamp(density, 1.0e-6, 1.0 - 1.0e-6);
-  let logit = log(d / (1.0 - d));
-  return (isoLogit - logit) / max(decodeK, 1.0e-6);
-}
-
 fn phiToDensity(phi: f32, decodeK: f32, isoLogit: f32) -> f32 {
   let x = isoLogit - decodeK * phi;
   return 1.0 / (1.0 + exp(-x));
 }
 
 fn evalRawDensity(p: vec3<f32>) -> f32 {
-  let residual = mlpResidual(p);
+  let residualTerms = mlpResidualTerms(p);
+  let lowTerm = fillParams.params1.w * residualTerms.x;
+  let highTerm = fillParams.params2.x * residualTerms.y;
+  let residual = lowTerm + highTerm;
   let mode = fillParams.params0.w;
   if (mode > 0.5) {
     let baselineSdf = fillParams.baselineHalfExtents.w * sdBox(p, fillParams.baselineHalfExtents.xyz);

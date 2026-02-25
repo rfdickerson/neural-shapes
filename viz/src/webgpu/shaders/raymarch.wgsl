@@ -17,7 +17,7 @@ struct CameraUniform {
 const kCloudWorldHalfExtents = vec3f(0.8112, 0.5515, 1.0);
 const kCloudWorldMin = -kCloudWorldHalfExtents;
 const kCloudWorldMax = kCloudWorldHalfExtents;
-const ENCODED_DIM = 39u;
+const ENCODED_DIM = 51u;
 const MAX_HIDDEN = 256u;
 
 struct MLPMetadata {
@@ -31,14 +31,15 @@ struct MLPMetadata {
   w2Offset: u32,
   b2Offset: u32,
   fourierLevels: u32,
+  outputDim: u32,
   _pad0: u32,
-  _pad1: u32,
 }
 
 struct FillParams {
   baselineHalfExtents: vec4<f32>, // xyz = half extents, w = baseline scale
   params0: vec4<f32>, // x=baseline sharpness, y=noise floor, z=soft knee width, w=representation mode
-  params1: vec4<f32>, // x=levelset decode k, y=iso logit, z=iso value, w=reserved
+  params1: vec4<f32>, // x=levelset decode k, y=iso logit, z=iso value, w=low residual scale
+  params2: vec4<f32>, // x=high residual scale, yzw=reserved
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;

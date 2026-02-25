@@ -34,6 +34,10 @@ LOSS_RAMP_STEPS="${LOSS_RAMP_STEPS:-3000}"
 TARGET_FIELD="${TARGET_FIELD:-levelset}"
 LEVELSET_DECODE_K="${LEVELSET_DECODE_K:-16.0}"
 LEVELSET_DENSITY_EPS="${LEVELSET_DENSITY_EPS:-1e-3}"
+RESIDUAL_CHANNELS="${RESIDUAL_CHANNELS:-2}"
+RESIDUAL_LOW_SCALE="${RESIDUAL_LOW_SCALE:-0.5}"
+RESIDUAL_HIGH_SCALE="${RESIDUAL_HIGH_SCALE:-0.15}"
+LOSS_HIGH_SURFACE_WEIGHT="${LOSS_HIGH_SURFACE_WEIGHT:-1.0}"
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   "$PYTHON" "$TRAIN_DIR/train_torus_residual.py" --help
@@ -76,6 +80,10 @@ fi
   --target-field "$TARGET_FIELD" \
   --levelset-decode-k "$LEVELSET_DECODE_K" \
   --levelset-density-eps "$LEVELSET_DENSITY_EPS" \
+  --residual-channels "$RESIDUAL_CHANNELS" \
+  --residual-low-scale "$RESIDUAL_LOW_SCALE" \
+  --residual-high-scale "$RESIDUAL_HIGH_SCALE" \
+  --loss-high-surface-weight "$LOSS_HIGH_SURFACE_WEIGHT" \
   --output-dir "$TRAIN_DIR/outputs" \
   --copy-to-viz \
   --viz-mlp-dir "$ROOT_DIR/viz/public/mlp" \

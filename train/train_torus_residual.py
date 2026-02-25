@@ -637,6 +637,40 @@ def gradient_regularization(
     return float(coeff) * grads.square().mean()
 
 
+def combine_residual_channels(
+    pred_raw: torch.Tensor,
+    low_scale: float,
+    high_scale: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if pred_raw.shape[-1] < 1:
+        raise ValueError(f"pred_raw must have at least one channel, got shape={tuple(pred_raw.shape)}")
+    low_raw = pred_raw[:, 0:1]
+    high_raw = pred_raw[:, 1:2] if pred_raw.shape[-1] > 1 else torch.zeros_like(low_raw)
+    low_term = float(low_scale) * low_raw
+    high_term = float(high_scale) * high_raw
+    return low_term + high_term, low_term, high_term
+
+
+def high_surface_residual_loss(
+    pred_high_term: torch.Tensor,
+    target_residual: torch.Tensor,
+    target_density: torch.Tensor,
+    surface_min: float,
+    surface_max: float,
+    coeff: float,
+) -> torch.Tensor:
+    if coeff <= 0.0:
+        return pred_high_term.new_zeros(())
+    smin = float(max(0.0, min(1.0, min(surface_min, surface_max))))
+    smax = float(max(0.0, min(1.0, max(surface_min, surface_max))))
+    mask = ((target_density >= smin) & (target_density <= smax)).to(pred_high_term.dtype)
+    count = torch.sum(mask)
+    if float(count.item()) < 1.0:
+        return pred_high_term.new_zeros(())
+    err = (pred_high_term - target_residual).square()
+    return float(coeff) * torch.sum(mask * err) / count
+
+
 def export_model(
     model: ResidualMLP,
     encoding_levels: int,
@@ -646,6 +680,8 @@ def export_model(
     levelset_decode_k: float,
     levelset_density_eps: float,
     levelset_iso_value: float,
+    residual_low_scale: float,
+    residual_high_scale: float,
     output_dir: Path,
     weights_name: str = "residual_mlp_weights.bin",
     meta_name: str = "residual_mlp_metadata.json",
@@ -709,6 +745,12 @@ def export_model(
                 int(model.fc2.out_features),
             ]
         },
+        "residual_decomposition": {
+            "type": "two_channel_additive",
+            "channels": int(model.fc2.out_features),
+            "low_scale": float(residual_low_scale),
+            "high_scale": float(residual_high_scale),
+        },
         "baseline": {
             "type": baseline_type,
             "half_extents": list(BOX_HALF_EXTENTS),
@@ -764,6 +806,12 @@ def train(args: argparse.Namespace) -> None:
     hidden1 = int(args.hidden_layers[1])
     if hidden0 <= 0 or hidden1 <= 0:
         raise ValueError(f"--hidden-layers values must be > 0, got {args.hidden_layers}")
+    if args.residual_channels not in (1, 2):
+        raise ValueError(f"--residual-channels must be 1 or 2, got {args.residual_channels}")
+    if args.residual_low_scale <= 0:
+        raise ValueError(f"--residual-low-scale must be > 0, got {args.residual_low_scale}")
+    if args.residual_high_scale < 0:
+        raise ValueError(f"--residual-high-scale must be >= 0, got {args.residual_high_scale}")
     if args.baseline_scale <= 0:
         raise ValueError(f"--baseline-scale must be > 0, got {args.baseline_scale}")
     if args.target_field not in ("density", "levelset"):
@@ -812,6 +860,10 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError(
             f"--loss-empty-space-weight must be >= 0, got {args.loss_empty_space_weight}"
         )
+    if args.loss_high_surface_weight < 0:
+        raise ValueError(
+            f"--loss-high-surface-weight must be >= 0, got {args.loss_high_surface_weight}"
+        )
     if args.val_ratio < 0 or args.val_ratio >= 1:
         raise ValueError(f"--val-ratio must be in [0,1), got {args.val_ratio}")
 
@@ -822,6 +874,12 @@ def train(args: argparse.Namespace) -> None:
         f"{args.fourier_levels}, order=input_xyz_then_per_level_sin_xyz_cos_xyz, freq=2**i (no 2pi)"
     )
     print(f"MLP hidden layers: [{hidden0}, {hidden1}]")
+    print(
+        "Residual decomposition: "
+        f"channels={args.residual_channels}, "
+        f"low_scale={args.residual_low_scale:.3f}, "
+        f"high_scale={args.residual_high_scale:.3f}"
+    )
     print(
         "Sampling: "
         f"importance_ratio={args.importance_ratio:.2f}, "
@@ -839,6 +897,7 @@ def train(args: argparse.Namespace) -> None:
         f"weighted_mse_abs_scale={args.loss_weight_abs_scale:.3f}, "
         f"l1_coeff={args.loss_l1_coeff:.3f}, "
         f"iso_weight={args.loss_iso_weight:.3f}, "
+        f"high_surface_weight={args.loss_high_surface_weight:.3f}, "
         f"empty_thr={args.empty_density_threshold:.3f}, "
         f"empty_weight={args.loss_empty_space_weight:.3f}, "
         f"grad_reg_coeff={args.grad_reg_coeff:.6f}"
@@ -953,7 +1012,11 @@ def train(args: argparse.Namespace) -> None:
         raise ValueError(f"--target-source must be one of ['torus', 'volume', 'samples'], got '{args.target_source}'")
 
     encoder = FourierEncoding(levels=args.fourier_levels).to(device)
-    model = ResidualMLP(input_dim=encoder.output_dim, hidden_sizes=(hidden0, hidden1), output_dim=1).to(device)
+    model = ResidualMLP(
+        input_dim=encoder.output_dim,
+        hidden_sizes=(hidden0, hidden1),
+        output_dim=int(args.residual_channels),
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     ema_mse = None
@@ -975,6 +1038,7 @@ def train(args: argparse.Namespace) -> None:
         abs_weight_scale_eff = args.loss_weight_abs_scale * loss_ramp
         iso_weight_eff = args.loss_iso_weight * loss_ramp
         empty_weight_eff = args.loss_empty_space_weight * loss_ramp
+        high_surface_weight_eff = (args.loss_high_surface_weight * loss_ramp) if args.residual_channels > 1 else 0.0
 
         points, target_residual, target_density, baseline_field = sample_batch(
             batch_size=args.batch_size,
@@ -999,7 +1063,12 @@ def train(args: argparse.Namespace) -> None:
         )
         points.requires_grad_(args.grad_reg_coeff > 0.0)
         encoded = encoder(points)
-        pred_residual = model(encoded)
+        pred_raw = model(encoded)
+        pred_residual, pred_low_term, pred_high_term = combine_residual_channels(
+            pred_raw,
+            low_scale=args.residual_low_scale,
+            high_scale=args.residual_high_scale,
+        )
         pred_field = baseline_field + pred_residual
         if args.target_field == "levelset":
             pred_density = phi_to_density(
@@ -1031,7 +1100,15 @@ def train(args: argparse.Namespace) -> None:
             empty_density_threshold=args.empty_density_threshold,
             coeff=empty_weight_eff,
         )
-        objective = data_objective + grad_reg + empty_leak
+        high_surface = high_surface_residual_loss(
+            pred_high_term=pred_high_term,
+            target_residual=target_residual,
+            target_density=target_density,
+            surface_min=args.surface_band_min,
+            surface_max=args.surface_band_max,
+            coeff=high_surface_weight_eff,
+        )
+        objective = data_objective + grad_reg + empty_leak + high_surface
 
         optimizer.zero_grad(set_to_none=True)
         objective.backward()
@@ -1041,6 +1118,7 @@ def train(args: argparse.Namespace) -> None:
         data_objective_val = float(data_objective.item())
         grad_reg_val = float(grad_reg.item())
         empty_leak_val = float(empty_leak.item())
+        high_surface_val = float(high_surface.item())
         mse_val = float(mse.item())
         l1_val = float(l1.item())
         ema_mse = mse_val if ema_mse is None else (0.98 * ema_mse + 0.02 * mse_val)
@@ -1049,7 +1127,8 @@ def train(args: argparse.Namespace) -> None:
             print(
                 f"step={step:6d}  obj={objective_val:.8f}  data_obj={data_objective_val:.8f}  "
                 f"mse={mse_val:.8f}  l1={l1_val:.8f}  grad={grad_reg_val:.8f}  "
-                f"empty={empty_leak_val:.8f}  ema_mse={ema_mse:.8f}  "
+                f"empty={empty_leak_val:.8f}  high_surface={high_surface_val:.8f}  "
+                f"ema_mse={ema_mse:.8f}  "
                 f"lr={lr_now:.6f}  ramp={loss_ramp:.3f}"
             )
 
@@ -1090,7 +1169,12 @@ def train(args: argparse.Namespace) -> None:
                 levelset_density_eps=args.levelset_density_eps,
             )
             eval_pred = model(encoder(points))
-            eval_pred_field = baseline_field + eval_pred
+            eval_pred_residual, _eval_low_term, eval_high_term = combine_residual_channels(
+                eval_pred,
+                low_scale=args.residual_low_scale,
+                high_scale=args.residual_high_scale,
+            )
+            eval_pred_field = baseline_field + eval_pred_residual
             if args.target_field == "levelset":
                 eval_pred_density = phi_to_density(
                     eval_pred_field,
@@ -1100,7 +1184,7 @@ def train(args: argparse.Namespace) -> None:
             else:
                 eval_pred_density = torch.clamp(eval_pred_field, 0.0, 1.0)
             eval_objective, eval_mse, eval_l1 = residual_loss_terms(
-                pred_residual=eval_pred,
+                pred_residual=eval_pred_residual,
                 target_residual=target_residual,
                 target_density=target_density,
                 abs_weight_scale=args.loss_weight_abs_scale,
@@ -1115,11 +1199,20 @@ def train(args: argparse.Namespace) -> None:
                 empty_density_threshold=args.empty_density_threshold,
                 coeff=args.loss_empty_space_weight,
             )
+            eval_high_surface = high_surface_residual_loss(
+                pred_high_term=eval_high_term,
+                target_residual=target_residual,
+                target_density=target_density,
+                surface_min=args.surface_band_min,
+                surface_max=args.surface_band_max,
+                coeff=args.loss_high_surface_weight if args.residual_channels > 1 else 0.0,
+            )
             print(
                 f"final_{label}_obj={float(eval_objective.item()):.8f}  "
                 f"final_{label}_mse={float(eval_mse.item()):.8f}  "
                 f"final_{label}_l1={float(eval_l1.item()):.8f}  "
                 f"final_{label}_empty={float(eval_empty_leak.item()):.8f}  "
+                f"final_{label}_high_surface={float(eval_high_surface.item()):.8f}  "
                 f"(trained_steps={stop_step})"
             )
 
@@ -1128,6 +1221,9 @@ def train(args: argparse.Namespace) -> None:
         "target_field": args.target_field,
         "levelset_decode_k": float(args.levelset_decode_k),
         "levelset_density_eps": float(args.levelset_density_eps),
+        "residual_channels": int(args.residual_channels),
+        "residual_low_scale": float(args.residual_low_scale),
+        "residual_high_scale": float(args.residual_high_scale),
         "iso_value": float(args.iso_value),
         "iso_band": float(args.iso_band),
         "iso_shell_ratio": float(args.iso_shell_ratio),
@@ -1135,6 +1231,7 @@ def train(args: argparse.Namespace) -> None:
         "surface_band_min": float(args.surface_band_min),
         "surface_band_max": float(args.surface_band_max),
         "iso_loss_weight": float(args.loss_iso_weight),
+        "loss_high_surface_weight": float(args.loss_high_surface_weight),
         "empty_density_threshold": float(args.empty_density_threshold),
         "empty_space_loss_weight": float(args.loss_empty_space_weight),
     }
@@ -1148,6 +1245,8 @@ def train(args: argparse.Namespace) -> None:
         levelset_decode_k=args.levelset_decode_k,
         levelset_density_eps=args.levelset_density_eps,
         levelset_iso_value=args.iso_value,
+        residual_low_scale=args.residual_low_scale,
+        residual_high_scale=args.residual_high_scale,
         output_dir=Path(args.output_dir),
         weights_name=args.weights_name,
         meta_name=args.meta_name,
@@ -1196,6 +1295,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Scale factor applied to baseline field (smooth box for density mode, SDF box for levelset mode).",
     )
     p.add_argument(
+        "--residual-channels",
+        type=int,
+        default=2,
+        choices=[1, 2],
+        help="Number of residual output channels. 2 enables low/high decomposition.",
+    )
+    p.add_argument(
+        "--residual-low-scale",
+        type=float,
+        default=0.5,
+        help="Scale applied to low-frequency residual channel during reconstruction.",
+    )
+    p.add_argument(
+        "--residual-high-scale",
+        type=float,
+        default=0.15,
+        help="Scale applied to high-frequency residual channel during reconstruction.",
+    )
+    p.add_argument(
         "--target-field",
         type=str,
         default="levelset",
@@ -1239,6 +1357,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Extra weight scale for residual error near iso-density shell.",
     )
     p.add_argument(
+        "--loss-high-surface-weight",
+        type=float,
+        default=1.0,
+        help="Auxiliary high-channel residual loss weight applied only inside the surface band.",
+    )
+    p.add_argument(
         "--loss-empty-space-weight",
         type=float,
         default=1.0,
@@ -1269,7 +1393,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=3000,
         help="Ramp-up steps for weighted/iso/empty loss scales.",
     )
-    p.add_argument("--fourier-levels", type=int, default=6)
+    p.add_argument("--fourier-levels", type=int, default=8)
     p.add_argument(
         "--hidden-layers",
         type=int,
