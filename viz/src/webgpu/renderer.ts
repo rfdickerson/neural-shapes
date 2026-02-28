@@ -1,5 +1,6 @@
 import shaderSource from "./shaders/raymarch.wgsl?raw";
 import fillVolumeSource from "./shaders/fillVolume.wgsl?raw";
+import bakeGradientSource from "./shaders/bakeGradient.wgsl?raw";
 import sunTransmittanceSource from "./shaders/sunTransmittance.wgsl?raw";
 import multiScatterSource from "./shaders/multiScatter.wgsl?raw";
 import type { OrbitCamera } from "./orbitCamera";
@@ -21,9 +22,6 @@ const DEFAULT_SUN_DIRECTION: [number, number, number] = [0.5826, 0.7660, 0.2717]
 const LIGHT_MARCH_STEPS = 96;
 const MULTISCATTER_ITERS = 8;
 const MULTISCATTER_LAMBDA = 0.58;
-const DEFAULT_RECON_NOISE_FLOOR = 0.02;
-const MAX_RECON_NOISE_FLOOR = 0.8;
-const RECON_NOISE_KNEE = 0.03;
 const DEFAULT_BASELINE_HALF_EXTENTS: [number, number, number] = [0.6, 0.25, 0.6];
 const DEFAULT_BASELINE_SHARPNESS = 14.0;
 const DEFAULT_BASELINE_SCALE = 1.0;
@@ -35,38 +33,37 @@ export type DensitySource = "neural" | "texture";
 interface ExportMetadata {
   layout: string;
   dtype: string;
-  residual_representation?: string;
+  training_mode?: string;
   encoding: {
-    levels: number;
+    type?: string;
+    levels?: number;
     include_input?: boolean;
     frequency_base?: number;
     uses_two_pi?: boolean;
     ordering?: string;
     axis_order?: string;
     input_dims?: number;
-    encoded_dims: number;
+    encoded_dims?: number;
+    iso_value?: number;
+    iso_band?: number;
+    delta?: number;
+    shell_weight_scale?: number;
+    curl_scale?: number;
   };
   network: {
     layers: number[];
   };
-  baseline?: {
-    type?: string;
-    half_extents?: number[];
-    sharpness?: number;
-    scale?: number;
-    sdf_scale?: number;
-  };
   reconstruction?: {
     type?: string;
-    iso_value?: number;
-    decode_k?: number;
-    density_epsilon?: number;
+    detail_amplitude?: number;
+    detail_fade_start?: number;
+    detail_fade_end?: number;
   };
-  residual_decomposition?: {
+  geometry?: {
     type?: string;
-    channels?: number;
-    low_scale?: number;
-    high_scale?: number;
+    bin?: string;
+    meta?: string;
+    dims?: number[];
   };
   offsets: Record<string, number>;
   total_floats: number;
@@ -76,6 +73,13 @@ interface LoadedMlpData {
   weightsFp16: Uint16Array<ArrayBuffer>;
   metaUniform: Uint32Array<ArrayBuffer>;
   fillParamsUniform: Float32Array<ArrayBuffer>;
+  featureVolume: LoadedBaselineGrid;
+  baselineGrid: LoadedBaselineGrid | null;
+}
+
+interface LoadedBaselineGrid {
+  dims: [number, number, number];
+  values: Float32Array<ArrayBuffer>;
 }
 
 const f32Scratch = new Float32Array(1);
@@ -130,6 +134,76 @@ function readOffset(record: Record<string, number>, key: string): number {
   return offset;
 }
 
+function normalizeMlpPublicUrl(pathOrUrl: string): string {
+  const trimmed = pathOrUrl.trim();
+  if (trimmed.length === 0) {
+    throw new Error("Baseline grid URL/path in metadata is empty.");
+  }
+  if (trimmed.startsWith("http://") || trimmed.startsWith("https://") || trimmed.startsWith("/")) {
+    return trimmed;
+  }
+  if (trimmed.startsWith("mlp/")) {
+    return `/${trimmed}`;
+  }
+  return `/mlp/${trimmed}`;
+}
+
+function parseGridDims(dims: unknown, label: string): [number, number, number] {
+  if (!Array.isArray(dims) || dims.length !== 3) {
+    throw new Error(`${label} must contain dims=[D,H,W].`);
+  }
+  const d = Math.trunc(Number(dims[0]));
+  const h = Math.trunc(Number(dims[1]));
+  const w = Math.trunc(Number(dims[2]));
+  if (!Number.isFinite(d) || !Number.isFinite(h) || !Number.isFinite(w) || d <= 0 || h <= 0 || w <= 0) {
+    throw new Error(`${label} dims must be positive integers, got ${JSON.stringify(dims)}.`);
+  }
+  return [d, h, w];
+}
+
+async function loadFloat32Volume(
+  binUrl: string,
+  metaUrl: string,
+  dimsOverride: [number, number, number] | null,
+  label: string
+): Promise<LoadedBaselineGrid> {
+  let dims = dimsOverride;
+  if (dims === null) {
+    const metaResponse = await fetch(metaUrl);
+    if (!metaResponse.ok) {
+      throw new Error(`Failed to load ${label} metadata '${metaUrl}'.`);
+    }
+    const parsed = (await metaResponse.json()) as { dims?: unknown };
+    dims = parseGridDims(parsed.dims, `${label} metadata '${metaUrl}'`);
+  }
+
+  const binResponse = await fetch(binUrl);
+  if (!binResponse.ok) {
+    throw new Error(`Failed to load ${label} binary '${binUrl}'.`);
+  }
+  const binBuffer = await binResponse.arrayBuffer();
+  if (binBuffer.byteLength % 4 !== 0) {
+    throw new Error(`${label} '${binUrl}' byte size must be divisible by 4.`);
+  }
+  const expectedFloats = dims[0] * dims[1] * dims[2];
+  const values = new Float32Array(binBuffer as ArrayBuffer);
+  if (values.length !== expectedFloats) {
+    throw new Error(`${label} '${binUrl}' float count mismatch: expected ${expectedFloats}, got ${values.length}.`);
+  }
+  return { dims, values };
+}
+
+async function loadFeatureVolumeForDetail(meta: Partial<ExportMetadata>): Promise<LoadedBaselineGrid> {
+  const geometry = meta.geometry ?? {};
+  if (geometry.bin) {
+    const binUrl = normalizeMlpPublicUrl(geometry.bin);
+    const metaUrl = normalizeMlpPublicUrl(geometry.meta ?? geometry.bin.replace(/\.bin$/i, ".json"));
+    const dims = geometry.dims !== undefined ? parseGridDims(geometry.dims, "MLP metadata geometry.dims") : null;
+    return loadFloat32Volume(binUrl, metaUrl, dims, "detail coarse density volume");
+  }
+  throw new Error("detail_only_density metadata is missing coarse density volume paths.");
+}
+
 async function loadExportedMlpData(): Promise<LoadedMlpData> {
   const metaResponse = await fetch(MLP_META_URL);
   if (!metaResponse.ok) {
@@ -147,6 +221,19 @@ async function loadExportedMlpData(): Promise<LoadedMlpData> {
   if (meta.dtype !== "float32") {
     throw new Error(`Expected float32 exported weights, got '${meta.dtype}'.`);
   }
+  if (meta.training_mode !== "detail_only_density") {
+    throw new Error(
+      `Unsupported training_mode '${meta.training_mode ?? "missing"}'. Expected 'detail_only_density'.`
+    );
+  }
+  if (meta.reconstruction?.type !== "coarse_plus_detail_tanh") {
+    throw new Error(
+      `Unsupported reconstruction type '${meta.reconstruction?.type ?? "missing"}'. Expected 'coarse_plus_detail_tanh'.`
+    );
+  }
+  if (meta.encoding.type !== "fourier") {
+    throw new Error(`Unsupported encoding type '${meta.encoding.type ?? "missing"}'. Expected 'fourier'.`);
+  }
 
   const layers = meta.network.layers ?? [];
   if (!Array.isArray(layers) || layers.length !== 4) {
@@ -159,19 +246,16 @@ async function loadExportedMlpData(): Promise<LoadedMlpData> {
   const hidden0 = Math.trunc(layers[1]);
   const hidden1 = Math.trunc(layers[2]);
   const outputDim = Math.trunc(layers[3]);
-  const fourierLevels = Math.trunc(meta.encoding.levels);
-  const encodedDims = Math.trunc(meta.encoding.encoded_dims);
+  const encodedDims = Math.trunc(meta.encoding.encoded_dims ?? -1);
   const includeInput = meta.encoding.include_input ?? true;
   const frequencyBase = meta.encoding.frequency_base ?? 2.0;
   const usesTwoPi = meta.encoding.uses_two_pi ?? false;
   const axisOrder = meta.encoding.axis_order ?? "xyz";
   const ordering = meta.encoding.ordering ?? EXPECTED_ENCODING_ORDER;
   const inputDims = Math.trunc(meta.encoding.input_dims ?? 3);
-  if (!Number.isFinite(fourierLevels) || !Number.isFinite(encodedDims)) {
-    throw new Error("MLP metadata encoding.levels / encoding.encoded_dims must be numeric.");
-  }
-  if (!Number.isFinite(inputDims)) {
-    throw new Error("MLP metadata encoding.input_dims must be numeric.");
+  const fourierLevels = Math.trunc(meta.encoding.levels ?? -1);
+  if (!Number.isFinite(fourierLevels) || !Number.isFinite(encodedDims) || !Number.isFinite(inputDims)) {
+    throw new Error("MLP metadata encoding.levels / encoding.encoded_dims / encoding.input_dims must be numeric.");
   }
   if (!includeInput) {
     throw new Error("Renderer expects Fourier encoding metadata include_input=true.");
@@ -191,11 +275,8 @@ async function loadExportedMlpData(): Promise<LoadedMlpData> {
   if (inputDims !== 3) {
     throw new Error(`Renderer expects encoding.input_dims=3, got ${inputDims}.`);
   }
-  if (fourierLevels < 1) {
-    throw new Error(`Renderer requires fourierLevels >= 1, got ${fourierLevels}.`);
-  }
-  if (fourierLevels > 8) {
-    throw new Error(`fourierLevels=${fourierLevels} exceeds shader max 8.`);
+  if (fourierLevels < 1 || fourierLevels > 8) {
+    throw new Error(`Renderer requires fourierLevels in [1,8], got ${fourierLevels}.`);
   }
   const expectedEncodedDims = 3 + 6 * fourierLevels;
   if (encodedDims !== expectedEncodedDims) {
@@ -203,12 +284,12 @@ async function loadExportedMlpData(): Promise<LoadedMlpData> {
       `encoded_dims=${encodedDims} does not match expected ${expectedEncodedDims} for fourierLevels=${fourierLevels}.`
     );
   }
-
-  if (outputDim < 1 || outputDim > 2) {
-    throw new Error(`Expected output_dim in [1,2], got ${outputDim}.`);
-  }
   if (inputDim !== encodedDims) {
     throw new Error(`Input dim mismatch: network input ${inputDim}, encoded dims ${encodedDims}.`);
+  }
+
+  if (outputDim !== 1) {
+    throw new Error(`detail_only_density expects output_dim=1, got ${outputDim}.`);
   }
   if (inputDim > SHADER_MAX_INPUT_DIM) {
     throw new Error(`inputDim=${inputDim} exceeds shader max ${SHADER_MAX_INPUT_DIM}.`);
@@ -259,103 +340,59 @@ async function loadExportedMlpData(): Promise<LoadedMlpData> {
   metaUniform[8] = b2Offset;
   metaUniform[9] = fourierLevels;
   metaUniform[10] = outputDim;
-  metaUniform[11] = 0;
+  metaUniform[11] = 2;
 
-  let baselineHalfExtents = DEFAULT_BASELINE_HALF_EXTENTS;
-  if (meta.baseline?.half_extents !== undefined) {
-    const extents = meta.baseline.half_extents;
-    if (!Array.isArray(extents) || extents.length !== 3 || !extents.every((x) => Number.isFinite(x) && x > 0)) {
-      throw new Error("MLP metadata baseline.half_extents must be a 3-element positive numeric array.");
-    }
-    baselineHalfExtents = [extents[0], extents[1], extents[2]];
-  }
-  const baselineSharpnessRaw = meta.baseline?.sharpness;
-  const baselineSharpness =
-    baselineSharpnessRaw === undefined
-      ? DEFAULT_BASELINE_SHARPNESS
-      : Number.isFinite(baselineSharpnessRaw) && baselineSharpnessRaw > 0
-        ? baselineSharpnessRaw
-        : (() => {
-            throw new Error("MLP metadata baseline.sharpness must be a positive number.");
-          })();
-  const baselineScaleRaw = meta.baseline?.sdf_scale ?? meta.baseline?.scale;
-  const baselineScale =
-    baselineScaleRaw === undefined
-      ? DEFAULT_BASELINE_SCALE
-      : Number.isFinite(baselineScaleRaw) && baselineScaleRaw > 0
-        ? baselineScaleRaw
-        : (() => {
-            throw new Error("MLP metadata baseline.scale must be a positive number.");
-          })();
-
-  const residualRepresentation =
-    meta.residual_representation === "levelset" || meta.reconstruction?.type === "sigmoid_levelset"
-      ? "levelset"
-      : "density";
-  const representationMode = residualRepresentation === "levelset" ? 1 : 0;
-  const decomp = meta.residual_decomposition;
-  if (decomp?.channels !== undefined) {
-    const decChannels = Math.trunc(decomp.channels);
-    if (decChannels !== outputDim) {
-      throw new Error(
-        `MLP metadata residual_decomposition.channels=${decChannels} does not match network output_dim=${outputDim}.`
-      );
-    }
-  }
-  const lowScaleRaw = decomp?.low_scale;
-  const lowScale =
-    lowScaleRaw === undefined
-      ? outputDim > 1
-        ? 0.5
-        : 1.0
-      : Number.isFinite(lowScaleRaw) && lowScaleRaw > 0
-        ? lowScaleRaw
-        : (() => {
-            throw new Error("MLP metadata residual_decomposition.low_scale must be a positive number.");
-          })();
-  const highScaleRaw = decomp?.high_scale;
-  const highScale =
-    highScaleRaw === undefined
-      ? outputDim > 1
-        ? 0.15
-        : 0.0
-      : Number.isFinite(highScaleRaw) && highScaleRaw >= 0
-        ? highScaleRaw
-        : (() => {
-            throw new Error("MLP metadata residual_decomposition.high_scale must be a non-negative number.");
-          })();
-  const levelsetDecodeKRaw = meta.reconstruction?.decode_k;
-  const levelsetDecodeK =
-    levelsetDecodeKRaw === undefined
-      ? 16.0
-      : Number.isFinite(levelsetDecodeKRaw) && levelsetDecodeKRaw > 0
-        ? levelsetDecodeKRaw
-        : (() => {
-            throw new Error("MLP metadata reconstruction.decode_k must be a positive number.");
-          })();
-  const levelsetIsoValueRaw = meta.reconstruction?.iso_value;
-  const levelsetIsoValue =
-    levelsetIsoValueRaw === undefined
-      ? 0.1
-      : Number.isFinite(levelsetIsoValueRaw) && levelsetIsoValueRaw > 0 && levelsetIsoValueRaw < 1
-        ? levelsetIsoValueRaw
-        : (() => {
-            throw new Error("MLP metadata reconstruction.iso_value must be in (0, 1).");
-          })();
+  const featureVolume = await loadFeatureVolumeForDetail(meta);
 
   const fillParamsUniform = createReconstructionParamsBufferData(
-    DEFAULT_RECON_NOISE_FLOOR,
-    baselineHalfExtents,
-    baselineSharpness,
-    baselineScale,
-    representationMode,
-    levelsetDecodeK,
-    levelsetIsoValue,
-    lowScale,
-    highScale
+    DEFAULT_BASELINE_HALF_EXTENTS,
+    DEFAULT_BASELINE_SHARPNESS,
+    DEFAULT_BASELINE_SCALE,
+    3,
+    1.0,
+    0.1,
+    1.0,
+    0.0,
+    0,
+    0.0,
+    0.0
   );
 
-  return { weightsFp16, metaUniform, fillParamsUniform };
+  const detailAmpRaw = meta.reconstruction?.detail_amplitude;
+  const detailAmp =
+    detailAmpRaw === undefined
+      ? 0.15
+      : Number.isFinite(detailAmpRaw) && detailAmpRaw > 0
+        ? detailAmpRaw
+        : (() => {
+            throw new Error("detail_only_density reconstruction.detail_amplitude must be > 0.");
+          })();
+  const fadeStartRaw = meta.reconstruction?.detail_fade_start;
+  const fadeStart =
+    fadeStartRaw === undefined
+      ? 0.02
+      : Number.isFinite(fadeStartRaw) && fadeStartRaw >= 0 && fadeStartRaw <= 1
+        ? fadeStartRaw
+        : (() => {
+            throw new Error("detail_only_density reconstruction.detail_fade_start must be in [0,1].");
+          })();
+  const fadeEndRaw = meta.reconstruction?.detail_fade_end;
+  const fadeEnd =
+    fadeEndRaw === undefined
+      ? 0.15
+      : Number.isFinite(fadeEndRaw) && fadeEndRaw >= 0 && fadeEndRaw <= 1
+        ? fadeEndRaw
+        : (() => {
+            throw new Error("detail_only_density reconstruction.detail_fade_end must be in [0,1].");
+          })();
+  if (fadeEnd <= fadeStart) {
+    throw new Error("detail_only_density reconstruction.detail_fade_end must be > detail_fade_start.");
+  }
+  fillParamsUniform[10] = fadeStart;
+  fillParamsUniform[11] = fadeEnd;
+  fillParamsUniform[15] = detailAmp;
+
+  return { weightsFp16, metaUniform, fillParamsUniform, featureVolume, baselineGrid: null };
 }
 
 function validateLoadedModel(metaUniform: Uint32Array<ArrayBuffer>): void {
@@ -467,6 +504,40 @@ function createBlueNoiseTextureData(size: number): Uint8Array<ArrayBuffer> {
   return out;
 }
 
+function alignTo(value: number, alignment: number): number {
+  return Math.ceil(value / alignment) * alignment;
+}
+
+function createPaddedVolumeUpload(
+  data: Float32Array<ArrayBuffer>,
+  dimsDhw: [number, number, number]
+): { bytes: Uint8Array<ArrayBuffer>; bytesPerRow: number; rowsPerImage: number } {
+  const depth = dimsDhw[0];
+  const height = dimsDhw[1];
+  const width = dimsDhw[2];
+  const expectedCount = depth * height * width;
+  if (data.length !== expectedCount) {
+    throw new Error(`Volume upload size mismatch: expected ${expectedCount}, got ${data.length}.`);
+  }
+  const rowBytes = width * 4;
+  const paddedRowBytes = alignTo(rowBytes, 256);
+  const rowsPerImage = height;
+  const paddedBytes = new Uint8Array<ArrayBuffer>(new ArrayBuffer(paddedRowBytes * rowsPerImage * depth));
+  const srcBytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  for (let z = 0; z < depth; z++) {
+    for (let y = 0; y < height; y++) {
+      const srcOffset = (z * height + y) * rowBytes;
+      const dstOffset = z * rowsPerImage * paddedRowBytes + y * paddedRowBytes;
+      paddedBytes.set(srcBytes.subarray(srcOffset, srcOffset + rowBytes), dstOffset);
+    }
+  }
+  return {
+    bytes: paddedBytes,
+    bytesPerRow: paddedRowBytes,
+    rowsPerImage
+  };
+}
+
 function createLightingParamsBufferData(
   sunDirection: [number, number, number],
   sunIntensity: number,
@@ -501,7 +572,6 @@ function densityControlToSigma(value: number): number {
 }
 
 function createReconstructionParamsBufferData(
-  noiseFloor: number,
   baselineHalfExtents: [number, number, number],
   baselineSharpness: number,
   baselineScale: number,
@@ -509,7 +579,10 @@ function createReconstructionParamsBufferData(
   levelsetDecodeK: number,
   levelsetIsoValue: number,
   residualLowScale: number,
-  residualHighScale: number
+  residualHighScale: number,
+  baselineMode: number,
+  baselineShellThreshold: number,
+  baselineSupportThreshold: number
 ): Float32Array<ArrayBuffer> {
   const data = new Float32Array<ArrayBuffer>(new ArrayBuffer(16 * 4)); // 4 vec4
   const iso = Math.max(1e-6, Math.min(levelsetIsoValue, 1.0 - 1e-6));
@@ -519,17 +592,17 @@ function createReconstructionParamsBufferData(
   data[2] = baselineHalfExtents[2];
   data[3] = baselineScale;
   data[4] = baselineSharpness;
-  data[5] = noiseFloor;
-  data[6] = RECON_NOISE_KNEE;
+  data[5] = 0;
+  data[6] = 0;
   data[7] = representationMode;
   data[8] = levelsetDecodeK;
   data[9] = isoLogit;
   data[10] = iso;
   data[11] = residualLowScale;
   data[12] = residualHighScale;
-  data[13] = 0;
-  data[14] = 0;
-  data[15] = 0;
+  data[13] = baselineMode;
+  data[14] = Math.max(0.0, baselineShellThreshold);
+  data[15] = Math.max(0.0, Math.min(1.0, baselineSupportThreshold));
   return data;
 }
 
@@ -537,7 +610,6 @@ export class WebGPURenderer {
   private renderMode: RenderMode = "cloudSky";
   private densitySource: DensitySource = "neural";
   private sigma = densityControlToSigma(DEFAULT_SIGMA);
-  private reconstructionNoiseFloor = DEFAULT_RECON_NOISE_FLOOR;
   private readonly phaseG = DEFAULT_PHASE_G;
   private readonly sunIntensity = DEFAULT_SUN_INTENSITY;
   private sunDirection = normalize3(
@@ -558,6 +630,8 @@ export class WebGPURenderer {
     private readonly cameraBuffer: GPUBuffer,
     private readonly fillPipeline: GPUComputePipeline,
     private readonly fillBindGroup: GPUBindGroup,
+    private readonly gradientPipeline: GPUComputePipeline,
+    private readonly gradientBindGroup: GPUBindGroup,
     private readonly reconstructionParamsBuffer: GPUBuffer,
     private readonly reconstructionParamsData: Float32Array<ArrayBuffer>,
     private readonly sunTransmittancePipeline: GPUComputePipeline,
@@ -602,6 +676,9 @@ export class WebGPURenderer {
     const fillVolumeShader = device.createShaderModule({
       code: fillVolumeSource
     });
+    const bakeGradientShader = device.createShaderModule({
+      code: bakeGradientSource
+    });
     const sunTransmittanceShader = device.createShaderModule({
       code: sunTransmittanceSource
     });
@@ -617,7 +694,70 @@ export class WebGPURenderer {
     const loadedMlp = await loadExportedMlpData();
     validateLoadedModel(loadedMlp.metaUniform);
 
-    const volumeTexture = device.createTexture({
+    const featureDimsDhw = loadedMlp.featureVolume.dims;
+    const featureTexture = device.createTexture({
+      size: {
+        width: featureDimsDhw[2],
+        height: featureDimsDhw[1],
+        depthOrArrayLayers: featureDimsDhw[0]
+      },
+      dimension: "3d",
+      format: "r32float",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+    });
+    const featureUpload = createPaddedVolumeUpload(loadedMlp.featureVolume.values, featureDimsDhw);
+    device.queue.writeTexture(
+      { texture: featureTexture },
+      featureUpload.bytes,
+      {
+        offset: 0,
+        bytesPerRow: featureUpload.bytesPerRow,
+        rowsPerImage: featureUpload.rowsPerImage
+      },
+      {
+        width: featureDimsDhw[2],
+        height: featureDimsDhw[1],
+        depthOrArrayLayers: featureDimsDhw[0]
+      }
+    );
+    const featureView = featureTexture.createView({ dimension: "3d" });
+
+    const baselineDimsDhw = loadedMlp.baselineGrid?.dims ?? [1, 1, 1];
+    const baselineValues =
+      loadedMlp.baselineGrid?.values ??
+      (() => {
+        const zeros = new Float32Array<ArrayBuffer>(new ArrayBuffer(4));
+        zeros[0] = 0;
+        return zeros;
+      })();
+    const baselineTexture = device.createTexture({
+      size: {
+        width: baselineDimsDhw[2],
+        height: baselineDimsDhw[1],
+        depthOrArrayLayers: baselineDimsDhw[0]
+      },
+      dimension: "3d",
+      format: "r32float",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST
+    });
+    const baselineUpload = createPaddedVolumeUpload(baselineValues, baselineDimsDhw);
+    device.queue.writeTexture(
+      { texture: baselineTexture },
+      baselineUpload.bytes,
+      {
+        offset: 0,
+        bytesPerRow: baselineUpload.bytesPerRow,
+        rowsPerImage: baselineUpload.rowsPerImage
+      },
+      {
+        width: baselineDimsDhw[2],
+        height: baselineDimsDhw[1],
+        depthOrArrayLayers: baselineDimsDhw[0]
+      }
+    );
+    const baselineView = baselineTexture.createView({ dimension: "3d" });
+
+    const densityTexture = device.createTexture({
       size: {
         width: VOLUME_SIZE,
         height: VOLUME_SIZE,
@@ -627,7 +767,19 @@ export class WebGPURenderer {
       format: "rgba16float",
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING
     });
-    const volumeView = volumeTexture.createView({ dimension: "3d" });
+    const densityView = densityTexture.createView({ dimension: "3d" });
+
+    const packedVolumeTexture = device.createTexture({
+      size: {
+        width: VOLUME_SIZE,
+        height: VOLUME_SIZE,
+        depthOrArrayLayers: VOLUME_SIZE
+      },
+      dimension: "3d",
+      format: "rgba16float",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING
+    });
+    const packedVolumeView = packedVolumeTexture.createView({ dimension: "3d" });
 
     const sunTransmittanceTexture = device.createTexture({
       size: {
@@ -765,19 +917,48 @@ export class WebGPURenderer {
       entries: [
         {
           binding: 0,
-          resource: volumeView
+          resource: densityView
         },
         {
           binding: 1,
-          resource: { buffer: mlpWeightsBuffer }
+          resource: featureView
         },
         {
           binding: 2,
-          resource: { buffer: mlpMetaBuffer }
+          resource: { buffer: mlpWeightsBuffer }
         },
         {
           binding: 3,
+          resource: { buffer: mlpMetaBuffer }
+        },
+        {
+          binding: 4,
           resource: { buffer: reconstructionParamsBuffer }
+        }
+      ]
+    });
+
+    const gradientPipeline = device.createComputePipeline({
+      layout: "auto",
+      compute: {
+        module: bakeGradientShader,
+        entryPoint: "csMain"
+      }
+    });
+    const gradientBindGroup = device.createBindGroup({
+      layout: gradientPipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: densityView
+        },
+        {
+          binding: 1,
+          resource: volumeSampler
+        },
+        {
+          binding: 2,
+          resource: packedVolumeView
         }
       ]
     });
@@ -794,7 +975,7 @@ export class WebGPURenderer {
       entries: [
         {
           binding: 0,
-          resource: volumeView
+          resource: densityView
         },
         {
           binding: 1,
@@ -835,7 +1016,7 @@ export class WebGPURenderer {
         },
         {
           binding: 3,
-          resource: volumeView
+          resource: densityView
         },
         {
           binding: 4,
@@ -864,7 +1045,7 @@ export class WebGPURenderer {
         },
         {
           binding: 3,
-          resource: volumeView
+          resource: densityView
         },
         {
           binding: 4,
@@ -884,6 +1065,12 @@ export class WebGPURenderer {
     fillPass.setBindGroup(0, fillBindGroup);
     fillPass.dispatchWorkgroups(VOLUME_SIZE / 4, VOLUME_SIZE / 4, VOLUME_SIZE / 4);
     fillPass.end();
+
+    const gradientPass = precomputeEncoder.beginComputePass();
+    gradientPass.setPipeline(gradientPipeline);
+    gradientPass.setBindGroup(0, gradientBindGroup);
+    gradientPass.dispatchWorkgroups(VOLUME_SIZE / 4, VOLUME_SIZE / 4, VOLUME_SIZE / 4);
+    gradientPass.end();
 
     const sunPass = precomputeEncoder.beginComputePass();
     sunPass.setPipeline(sunTransmittancePipeline);
@@ -974,6 +1161,14 @@ export class WebGPURenderer {
             sampleType: "float",
             viewDimension: "2d"
           }
+        },
+        {
+          binding: 9,
+          visibility: GPUShaderStage.FRAGMENT,
+          texture: {
+            sampleType: "unfilterable-float",
+            viewDimension: "3d"
+          }
         }
       ]
     });
@@ -991,7 +1186,7 @@ export class WebGPURenderer {
         },
         {
           binding: 2,
-          resource: volumeView
+          resource: packedVolumeView
         },
         {
           binding: 3,
@@ -1016,6 +1211,10 @@ export class WebGPURenderer {
         {
           binding: 8,
           resource: blueNoiseView
+        },
+        {
+          binding: 9,
+          resource: baselineView
         }
       ]
     });
@@ -1045,6 +1244,8 @@ export class WebGPURenderer {
       cameraBuffer,
       fillPipeline,
       fillBindGroup,
+      gradientPipeline,
+      gradientBindGroup,
       reconstructionParamsBuffer,
       reconstructionParamsData,
       sunTransmittancePipeline,
@@ -1078,21 +1279,6 @@ export class WebGPURenderer {
     this.frameDirty = true;
   }
 
-  setReconstructionNoiseFloor(value: number): void {
-    if (!Number.isFinite(value)) {
-      return;
-    }
-    const next = Math.max(0.0, Math.min(value, MAX_RECON_NOISE_FLOOR));
-    if (Math.abs(this.reconstructionNoiseFloor - next) < 1e-5) {
-      return;
-    }
-    this.reconstructionNoiseFloor = next;
-    this.reconstructionParamsData[5] = next;
-    this.device.queue.writeBuffer(this.reconstructionParamsBuffer, 0, this.reconstructionParamsData);
-    this.volumeDirty = true;
-    this.frameDirty = true;
-  }
-
   setSunAngles(pitchDegrees: number, azimuthDegrees: number): void {
     if (!Number.isFinite(pitchDegrees) || !Number.isFinite(azimuthDegrees)) {
       return;
@@ -1120,6 +1306,11 @@ export class WebGPURenderer {
     fillPass.setBindGroup(0, this.fillBindGroup);
     fillPass.dispatchWorkgroups(VOLUME_SIZE / 4, VOLUME_SIZE / 4, VOLUME_SIZE / 4);
     fillPass.end();
+    const gradientPass = fillEncoder.beginComputePass();
+    gradientPass.setPipeline(this.gradientPipeline);
+    gradientPass.setBindGroup(0, this.gradientBindGroup);
+    gradientPass.dispatchWorkgroups(VOLUME_SIZE / 4, VOLUME_SIZE / 4, VOLUME_SIZE / 4);
+    gradientPass.end();
     this.device.queue.submit([fillEncoder.finish()]);
 
     this.updateLightingPrecompute();

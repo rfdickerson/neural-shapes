@@ -13,77 +13,97 @@ else
 fi
 
 VDB_PATH="${VDB_PATH:-$TRAIN_DIR/wdas_cloud_quarter.vdb}"
-SAMPLE_COUNT="${SAMPLE_COUNT:-4000000}"
+# Smoke-test friendly default; override with SAMPLE_COUNT for full runs.
+SAMPLE_COUNT="${SAMPLE_COUNT:-250000}"
 SAMPLES_BIN="${SAMPLES_BIN:-$TRAIN_DIR/outputs/wdas_cloud_quarter_samples_${SAMPLE_COUNT}.bin}"
 SAMPLES_META="${SAMPLES_META:-$TRAIN_DIR/outputs/wdas_cloud_quarter_samples_${SAMPLE_COUNT}.json}"
 FORCE_REBUILD_SAMPLES="${FORCE_REBUILD_SAMPLES:-0}"
-ISO_VALUE="${ISO_VALUE:-0.10}"
-ISO_BAND="${ISO_BAND:-0.05}"
-ISO_SHELL_RATIO="${ISO_SHELL_RATIO:-0.35}"
-SURFACE_BAND_RATIO="${SURFACE_BAND_RATIO:-0.55}"
-SURFACE_BAND_MIN="${SURFACE_BAND_MIN:-0.05}"
-SURFACE_BAND_MAX="${SURFACE_BAND_MAX:-0.30}"
-ISO_LOSS_WEIGHT="${ISO_LOSS_WEIGHT:-3.0}"
-EMPTY_DENSITY_THRESHOLD="${EMPTY_DENSITY_THRESHOLD:-0.02}"
-EMPTY_SPACE_LOSS_WEIGHT="${EMPTY_SPACE_LOSS_WEIGHT:-1.0}"
+
+TRAINING_MODE="${TRAINING_MODE:-detail_only_density}"
+TARGET_SOURCE="${TARGET_SOURCE:-samples}"
+
+BATCH_SIZE="${BATCH_SIZE:-8192}"
+EVAL_SAMPLES="${EVAL_SAMPLES:-32768}"
+MAX_STEPS="${MAX_STEPS:-12000}"
+MIN_STEPS="${MIN_STEPS:-500}"
+TARGET_MSE="${TARGET_MSE:-5e-5}"
+
+FOURIER_LEVELS="${FOURIER_LEVELS:-8}"
 HIDDEN_SIZE="${HIDDEN_SIZE:-128}"
-VAL_RATIO="${VAL_RATIO:-0.10}"
+
+LR="${LR:-5e-4}"
 LR_FINAL="${LR_FINAL:-1e-4}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-300}"
-LOSS_RAMP_STEPS="${LOSS_RAMP_STEPS:-3000}"
-TARGET_FIELD="${TARGET_FIELD:-levelset}"
-LEVELSET_DECODE_K="${LEVELSET_DECODE_K:-16.0}"
-LEVELSET_DENSITY_EPS="${LEVELSET_DENSITY_EPS:-1e-3}"
-RESIDUAL_CHANNELS="${RESIDUAL_CHANNELS:-2}"
-RESIDUAL_LOW_SCALE="${RESIDUAL_LOW_SCALE:-0.5}"
-RESIDUAL_HIGH_SCALE="${RESIDUAL_HIGH_SCALE:-0.15}"
-LOSS_HIGH_SURFACE_WEIGHT="${LOSS_HIGH_SURFACE_WEIGHT:-1.0}"
+
+DETAIL_GRID_DIM="${DETAIL_GRID_DIM:-64}"
+DETAIL_AMPLITUDE="${DETAIL_AMPLITUDE:-0.15}"
+DETAIL_INSIDE_THRESHOLD="${DETAIL_INSIDE_THRESHOLD:-0.01}"
+DETAIL_SHELL_BOOST="${DETAIL_SHELL_BOOST:-2.0}"
+DETAIL_SMOOTHNESS_COEFF="${DETAIL_SMOOTHNESS_COEFF:-0.0}"
+DETAIL_FADE_START="${DETAIL_FADE_START:-0.02}"
+DETAIL_FADE_END="${DETAIL_FADE_END:-0.15}"
+
+ISO_VALUE="${ISO_VALUE:-0.10}"
+ISO_BAND="${ISO_BAND:-0.05}"
+
+IMPORTANCE_OVERSAMPLE="${IMPORTANCE_OVERSAMPLE:-4}"
+IMPORTANCE_MAX_ROUNDS="${IMPORTANCE_MAX_ROUNDS:-8}"
+
+VAL_RATIO="${VAL_RATIO:-0.10}"
+COARSE_GRID_SOURCE_BIN="${COARSE_GRID_SOURCE_BIN:-$TRAIN_DIR/outputs/wdas_cloud_quarter_256.bin}"
+COARSE_GRID_SOURCE_META="${COARSE_GRID_SOURCE_META:-$TRAIN_DIR/outputs/wdas_cloud_quarter_256.json}"
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   "$PYTHON" "$TRAIN_DIR/train_torus_residual.py" --help
   exit 0
 fi
 
-if [[ ! -f "$VDB_PATH" ]]; then
-  echo "error: missing VDB source file: $VDB_PATH" >&2
-  exit 1
-fi
+if [[ "$TARGET_SOURCE" == "samples" ]]; then
+  if [[ ! -f "$VDB_PATH" ]]; then
+    echo "error: missing VDB source file: $VDB_PATH" >&2
+    exit 1
+  fi
 
-mkdir -p "$(dirname "$SAMPLES_BIN")"
+  mkdir -p "$(dirname "$SAMPLES_BIN")"
 
-if [[ "$FORCE_REBUILD_SAMPLES" == "1" || ! -f "$SAMPLES_BIN" || ! -f "$SAMPLES_META" ]]; then
-  "$TRAIN_DIR/sample_vdb_points.sh" \
-    --input "$VDB_PATH" \
-    --output-bin "$SAMPLES_BIN" \
-    --output-json "$SAMPLES_META" \
-    --samples "$SAMPLE_COUNT"
+  if [[ "$FORCE_REBUILD_SAMPLES" == "1" || ! -f "$SAMPLES_BIN" || ! -f "$SAMPLES_META" ]]; then
+    "$TRAIN_DIR/sample_vdb_points.sh" \
+      --input "$VDB_PATH" \
+      --output-bin "$SAMPLES_BIN" \
+      --output-json "$SAMPLES_META" \
+      --samples "$SAMPLE_COUNT"
+  fi
 fi
 
 "$PYTHON" "$TRAIN_DIR/train_torus_residual.py" \
-  --target-source samples \
+  --training-mode "$TRAINING_MODE" \
+  --target-source "$TARGET_SOURCE" \
   --samples-bin "$SAMPLES_BIN" \
   --samples-meta "$SAMPLES_META" \
-  --iso-value "$ISO_VALUE" \
-  --iso-band "$ISO_BAND" \
-  --iso-shell-ratio "$ISO_SHELL_RATIO" \
-  --surface-band-ratio "$SURFACE_BAND_RATIO" \
-  --surface-band-min "$SURFACE_BAND_MIN" \
-  --surface-band-max "$SURFACE_BAND_MAX" \
-  --loss-iso-weight "$ISO_LOSS_WEIGHT" \
-  --empty-density-threshold "$EMPTY_DENSITY_THRESHOLD" \
-  --loss-empty-space-weight "$EMPTY_SPACE_LOSS_WEIGHT" \
+  --batch-size "$BATCH_SIZE" \
+  --eval-samples "$EVAL_SAMPLES" \
+  --max-steps "$MAX_STEPS" \
+  --min-steps "$MIN_STEPS" \
+  --target-mse "$TARGET_MSE" \
+  --fourier-levels "$FOURIER_LEVELS" \
   --hidden-layers "$HIDDEN_SIZE" "$HIDDEN_SIZE" \
-  --val-ratio "$VAL_RATIO" \
+  --lr "$LR" \
   --lr-final "$LR_FINAL" \
   --lr-warmup-steps "$LR_WARMUP_STEPS" \
-  --loss-ramp-steps "$LOSS_RAMP_STEPS" \
-  --target-field "$TARGET_FIELD" \
-  --levelset-decode-k "$LEVELSET_DECODE_K" \
-  --levelset-density-eps "$LEVELSET_DENSITY_EPS" \
-  --residual-channels "$RESIDUAL_CHANNELS" \
-  --residual-low-scale "$RESIDUAL_LOW_SCALE" \
-  --residual-high-scale "$RESIDUAL_HIGH_SCALE" \
-  --loss-high-surface-weight "$LOSS_HIGH_SURFACE_WEIGHT" \
+  --detail-grid-dim "$DETAIL_GRID_DIM" \
+  --detail-amplitude "$DETAIL_AMPLITUDE" \
+  --detail-inside-threshold "$DETAIL_INSIDE_THRESHOLD" \
+  --detail-shell-boost "$DETAIL_SHELL_BOOST" \
+  --detail-smoothness-coeff "$DETAIL_SMOOTHNESS_COEFF" \
+  --detail-fade-start "$DETAIL_FADE_START" \
+  --detail-fade-end "$DETAIL_FADE_END" \
+  --iso-value "$ISO_VALUE" \
+  --iso-band "$ISO_BAND" \
+  --importance-oversample "$IMPORTANCE_OVERSAMPLE" \
+  --importance-max-rounds "$IMPORTANCE_MAX_ROUNDS" \
+  --val-ratio "$VAL_RATIO" \
+  --coarse-grid-source-bin "$COARSE_GRID_SOURCE_BIN" \
+  --coarse-grid-source-meta "$COARSE_GRID_SOURCE_META" \
   --output-dir "$TRAIN_DIR/outputs" \
   --copy-to-viz \
   --viz-mlp-dir "$ROOT_DIR/viz/public/mlp" \

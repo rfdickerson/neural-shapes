@@ -1,7 +1,7 @@
 {
   "layout": "[W0][b0][W1][b1][W2][b2]",
   "dtype": "float32",
-  "residual_representation": "levelset",
+  "training_mode": "detail_only_density",
   "encoding": {
     "type": "fourier",
     "levels": 8,
@@ -18,46 +18,37 @@
       51,
       128,
       128,
-      2
+      1
     ]
   },
-  "residual_decomposition": {
-    "type": "two_channel_additive",
-    "channels": 2,
-    "low_scale": 0.5,
-    "high_scale": 0.15
-  },
-  "baseline": {
-    "type": "sdf_box",
-    "half_extents": [
-      0.6,
-      0.25,
-      0.6
-    ],
-    "sharpness": 14.0,
-    "scale": 1.0,
-    "sdf_scale": 1.0
-  },
   "reconstruction": {
-    "type": "sigmoid_levelset",
-    "iso_value": 0.1,
-    "decode_k": 32.0,
-    "density_epsilon": 0.001
+    "type": "coarse_plus_detail_tanh",
+    "detail_amplitude": 0.15,
+    "detail_fade_start": 0.02,
+    "detail_fade_end": 0.15
+  },
+  "geometry": {
+    "type": "coarse_density_volume",
+    "bin": "detail_coarse_density.bin",
+    "meta": "detail_coarse_density.json",
+    "dims": [
+      64,
+      64,
+      64
+    ],
+    "domain": "[-1,1]^3"
   },
   "ground_truth": {
     "type": "sparse_samples",
-    "bin_path": "/home/rfdic/projects/neural-clouds/train/outputs/wdas_cloud_quarter_samples_4000000.bin",
-    "meta_path": "/home/rfdic/projects/neural-clouds/train/outputs/wdas_cloud_quarter_samples_4000000.json",
-    "count": 4000000,
-    "guided_count": 868417,
-    "shell_count": 31614,
-    "surface_count": 69052,
-    "train_count": 3600000,
-    "test_count": 400000,
+    "bin_path": "/home/rfdic/projects/neural-clouds/train/outputs/wdas_cloud_quarter_samples_250000.bin",
+    "meta_path": "/home/rfdic/projects/neural-clouds/train/outputs/wdas_cloud_quarter_samples_250000.json",
+    "count": 250000,
+    "train_count": 225000,
+    "test_count": 25000,
     "val_ratio": 0.1,
     "meta": {
       "format": "xyz_density_f32",
-      "count": 4000000,
+      "count": 250000,
       "stride_floats": 4,
       "domain": "normalized_cube",
       "domain_min": [
@@ -87,27 +78,32 @@
       "stats": {
         "density_min": 0,
         "density_max": 1,
-        "density_mean": 0.116921
+        "density_mean": 0.116962
       }
     },
     "training_focus": {
-      "type": "iso_surface_shell",
-      "target_field": "levelset",
-      "levelset_decode_k": 32.0,
-      "levelset_density_eps": 0.001,
-      "residual_channels": 2,
-      "residual_low_scale": 0.5,
-      "residual_high_scale": 0.15,
+      "type": "detail_only_density",
+      "coarse_grid_dim": 64,
+      "detail_amplitude": 0.15,
+      "inside_threshold": 0.01,
+      "sampling": {
+        "uniform_ratio": 0.5,
+        "inside_ratio": 0.5
+      },
+      "shell_boost": 2.0,
       "iso_value": 0.1,
       "iso_band": 0.05,
-      "iso_shell_ratio": 0.35,
-      "surface_band_ratio": 0.55,
-      "surface_band_min": 0.05,
-      "surface_band_max": 0.3,
-      "iso_loss_weight": 3.0,
-      "loss_high_surface_weight": 1.0,
-      "empty_density_threshold": 0.02,
-      "empty_space_loss_weight": 1.0
+      "detail_fade_start": 0.02,
+      "detail_fade_end": 0.15,
+      "coarse_grid": {
+        "bin": "detail_coarse_density.bin",
+        "meta": "detail_coarse_density.json",
+        "dims": [
+          64,
+          64,
+          64
+        ]
+      }
     }
   },
   "offsets": {
@@ -116,15 +112,15 @@
     "W1": 6656,
     "b1": 23040,
     "W2": 23168,
-    "b2": 23424
+    "b2": 23296
   },
   "counts": {
     "W0": 6528,
     "b0": 128,
     "W1": 16384,
     "b1": 128,
-    "W2": 256,
-    "b2": 2
+    "W2": 128,
+    "b2": 1
   },
   "shapes": {
     "W0": [
@@ -142,13 +138,13 @@
       128
     ],
     "W2": [
-      2,
+      1,
       128
     ],
     "b2": [
-      2
+      1
     ]
   },
-  "total_floats": 23426,
-  "total_bytes": 93704
+  "total_floats": 23297,
+  "total_bytes": 93188
 }

@@ -31,7 +31,7 @@ fn hash3(p: vec3u) -> u32 {
 
 fn sampleDensity(p: vec3f) -> f32 {
   let uvw = worldToLocal(p) * 0.5 + vec3f(0.5);
-  if (any(uvw < vec3f(0.0)) || any(uvw > vec3f(1.0))) {
+  if (any(uvw <= vec3f(0.0)) || any(uvw >= vec3f(1.0))) {
     return 0.0;
   }
   return clamp(textureSampleLevel(densityVolume, densitySampler, uvw, 0.0).r, 0.0, 1.0);

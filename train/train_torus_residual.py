@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Train a residual MLP to approximate a density field relative to a box baseline.
+Train a detail-only density MLP for clouds.
+
+Representation:
+  density(x) = clamp(coarse_density(x) + detail_amplitude * detail(x), 0, 1)
+  detail(x) = tanh(mlp(fourier(x)))
 
 Targets supported:
   - torus (analytic smooth torus)
@@ -9,7 +13,8 @@ Targets supported:
 
 This script exports:
   - FP32 flat weight blob in layout [W0][b0][W1][b1][W2][b2]
-  - metadata JSON with layer sizes and offsets
+  - metadata JSON for coarse+detail reconstruction
+  - coarse density grid (.bin + .json)
 """
 
 from __future__ import annotations
@@ -27,8 +32,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-BOX_HALF_EXTENTS: Tuple[float, float, float] = (0.6, 0.25, 0.6)
-BOX_SHARPNESS: float = 14.0
 TORUS_MAJOR_RADIUS: float = 0.55
 TORUS_MINOR_RADIUS: float = 0.2
 TORUS_SHARPNESS: float = 36.0
@@ -38,9 +41,6 @@ TORUS_SHARPNESS: float = 36.0
 class SparseSampleBank:
     points: torch.Tensor  # [N,3] in normalized [-1,1]^3
     density: torch.Tensor  # [N] in [0,1]
-    guided_indices: torch.Tensor  # [M] indices with density > importance threshold
-    shell_indices: torch.Tensor  # [K] indices near target iso-density shell
-    surface_indices: torch.Tensor  # [S] indices in boundary detail band [surface_min, surface_max]
 
 
 def sdf_torus(
@@ -54,51 +54,19 @@ def sdf_torus(
     return torch.sqrt(qx * qx + qy * qy + 1e-12) - minor_radius
 
 
-def sdf_box(points: torch.Tensor, half_extents: Tuple[float, float, float] = BOX_HALF_EXTENTS) -> torch.Tensor:
-    b = torch.tensor(half_extents, device=points.device, dtype=points.dtype)
-    q = torch.abs(points) - b
-    outside = torch.clamp(q, min=0.0)
-    outside_len = torch.linalg.norm(outside, dim=-1)
-    inside = torch.clamp(torch.amax(q, dim=-1), max=0.0)
-    return outside_len + inside
-
-
-def density_from_sdf(sdf: torch.Tensor, sharpness: float) -> torch.Tensor:
-    return torch.sigmoid(-sharpness * sdf)
-
-
 def torus_density(points: torch.Tensor) -> torch.Tensor:
-    return density_from_sdf(sdf_torus(points), sharpness=TORUS_SHARPNESS)
-
-
-def box_density(points: torch.Tensor) -> torch.Tensor:
-    # Smooth procedural baseline.
-    return density_from_sdf(sdf_box(points), sharpness=BOX_SHARPNESS)
-
-
-def density_to_phi(density: torch.Tensor, iso_value: float, decode_k: float, eps: float = 1.0e-6) -> torch.Tensor:
-    iso = float(max(eps, min(1.0 - eps, iso_value)))
-    k = float(max(1.0e-6, decode_k))
-    d = density.clamp(eps, 1.0 - eps)
-    iso_logit = math.log(iso / (1.0 - iso))
-    return (iso_logit - torch.log(d / (1.0 - d))) / k
-
-
-def phi_to_density(phi: torch.Tensor, iso_value: float, decode_k: float) -> torch.Tensor:
-    iso = float(max(1.0e-6, min(1.0 - 1.0e-6, iso_value)))
-    k = float(max(1.0e-6, decode_k))
-    iso_logit = math.log(iso / (1.0 - iso))
-    return torch.sigmoid(iso_logit - k * phi)
+    return torch.sigmoid(-TORUS_SHARPNESS * sdf_torus(points))
 
 
 def load_dense_volume(
     volume_bin_path: Path,
     volume_meta_path: Path | None,
     device: torch.device,
+    clamp_to_unit: bool = True,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     meta_path = volume_meta_path if volume_meta_path is not None else volume_bin_path.with_suffix(".json")
     if not volume_bin_path.exists():
-        raise FileNotFoundError(f"missing volume binary: {volume_bin_path}")
+        raise FileNotFoundError(f"missing dense volume binary: {volume_bin_path}")
     if not meta_path.exists():
         raise FileNotFoundError(f"missing volume metadata: {meta_path}")
 
@@ -106,35 +74,51 @@ def load_dense_volume(
     dims = meta.get("dims")
     if not isinstance(dims, list) or len(dims) != 3:
         raise ValueError(f"volume metadata must contain dims=[D,H,W], got {dims}")
-    try:
-        depth, height, width = int(dims[0]), int(dims[1]), int(dims[2])
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"invalid dims values in {meta_path}: {dims}") from exc
-    if depth <= 1 or height <= 1 or width <= 1:
-        raise ValueError(f"dims must be > 1 in all axes, got {dims}")
 
+    depth, height, width = int(dims[0]), int(dims[1]), int(dims[2])
+    expected_floats = depth * height * width
     raw = volume_bin_path.read_bytes()
-    expected_bytes = depth * height * width * 4
-    if len(raw) != expected_bytes:
+    if len(raw) != expected_floats * 4:
         raise ValueError(
-            f"volume byte size mismatch: expected {expected_bytes}, got {len(raw)} "
-            f"(dims={dims}, dtype=float32)"
+            f"volume size mismatch for {volume_bin_path}: expected {expected_floats * 4} bytes, got {len(raw)} bytes"
         )
 
     flat = torch.frombuffer(bytearray(raw), dtype=torch.float32).clone()
     volume = flat.view(depth, height, width).to(device=device, dtype=torch.float32)
-    volume = volume.clamp(0.0, 1.0)
+    if clamp_to_unit:
+        volume = volume.clamp(0.0, 1.0)
     return volume, meta
+
+
+def save_dense_grid(
+    grid: torch.Tensor,
+    grid_bin_path: Path,
+    grid_meta_path: Path,
+    field_name: str,
+    extra_meta: Dict[str, Any] | None = None,
+) -> None:
+    g = grid.detach().to(device="cpu", dtype=torch.float32).contiguous()
+    if g.ndim != 3:
+        raise ValueError(f"expected 3D grid, got shape={tuple(g.shape)}")
+    depth, height, width = int(g.shape[0]), int(g.shape[1]), int(g.shape[2])
+    grid_bin_path.parent.mkdir(parents=True, exist_ok=True)
+    grid_meta_path.parent.mkdir(parents=True, exist_ok=True)
+    flat = g.view(-1).tolist()
+    grid_bin_path.write_bytes(struct.pack(f"<{len(flat)}f", *flat))
+    meta: Dict[str, Any] = {
+        "dims": [depth, height, width],
+        "dtype": "float32",
+        "field": field_name,
+        "domain": "[-1,1]^3",
+    }
+    if extra_meta is not None:
+        meta.update(extra_meta)
+    grid_meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
 def load_sparse_samples(
     samples_bin_path: Path,
     samples_meta_path: Path | None,
-    importance_threshold: float,
-    iso_value: float,
-    iso_band: float,
-    surface_min: float,
-    surface_max: float,
 ) -> Tuple[SparseSampleBank, Dict[str, Any]]:
     meta_path = samples_meta_path if samples_meta_path is not None else samples_bin_path.with_suffix(".json")
     if not samples_bin_path.exists():
@@ -144,74 +128,34 @@ def load_sparse_samples(
 
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     raw = samples_bin_path.read_bytes()
-    if len(raw) % 16 != 0:
-        raise ValueError(
-            f"sparse samples byte size must be divisible by 16 (xyz+density float32), got {len(raw)}"
-        )
+    row_bytes = 4 * 4  # xyz + density, float32
+    if len(raw) % row_bytes != 0:
+        raise ValueError(f"sparse samples size mismatch for {samples_bin_path}: byte_count={len(raw)} not divisible by 16")
 
-    count = len(raw) // 16
-    meta_count = meta.get("count")
-    if meta_count is not None:
+    count = len(raw) // row_bytes
+    if count <= 0:
+        raise ValueError(f"no samples found in {samples_bin_path}")
+
+    if "count" in meta:
         try:
-            meta_count_int = int(meta_count)
-        except Exception as exc:  # noqa: BLE001
-            raise ValueError(f"invalid count in sparse samples metadata: {meta_count}") from exc
-        if meta_count_int != count:
+            meta_count = int(meta["count"])
+        except Exception as exc:
+            raise ValueError(f"invalid count in sparse samples metadata: {meta.get('count')}") from exc
+        if meta_count != count:
             raise ValueError(
-                f"sparse samples count mismatch: metadata count={meta_count_int}, binary count={count}"
+                f"sparse samples count mismatch: metadata count={meta_count}, binary count={count}"
             )
 
     flat = torch.frombuffer(bytearray(raw), dtype=torch.float32).clone().view(count, 4)
-    points = flat[:, 0:3].contiguous().clamp(-1.0, 1.0)
+    points = flat[:, :3].contiguous().clamp(-1.0, 1.0)
     density = flat[:, 3].contiguous().clamp(0.0, 1.0)
-    bank = build_sparse_sample_bank(
-        points=points,
-        density=density,
-        importance_threshold=importance_threshold,
-        iso_value=iso_value,
-        iso_band=iso_band,
-        surface_min=surface_min,
-        surface_max=surface_max,
-    )
-    return bank, meta
-
-
-def build_sparse_sample_bank(
-    points: torch.Tensor,
-    density: torch.Tensor,
-    importance_threshold: float,
-    iso_value: float,
-    iso_band: float,
-    surface_min: float,
-    surface_max: float,
-) -> SparseSampleBank:
-    guided_indices = torch.nonzero(density > max(0.0, float(importance_threshold)), as_tuple=False).squeeze(1)
-    iso_center = float(max(0.0, min(1.0, iso_value)))
-    iso_width = max(1.0e-6, float(iso_band))
-    shell_mask = torch.abs(density - iso_center) <= iso_width
-    shell_indices = torch.nonzero(shell_mask, as_tuple=False).squeeze(1)
-    smin = float(max(0.0, min(1.0, min(surface_min, surface_max))))
-    smax = float(max(0.0, min(1.0, max(surface_min, surface_max))))
-    surface_mask = (density >= smin) & (density <= smax)
-    surface_indices = torch.nonzero(surface_mask, as_tuple=False).squeeze(1)
-    return SparseSampleBank(
-        points=points,
-        density=density,
-        guided_indices=guided_indices.to(torch.long),
-        shell_indices=shell_indices.to(torch.long),
-        surface_indices=surface_indices.to(torch.long),
-    )
+    return SparseSampleBank(points=points, density=density), meta
 
 
 def split_sparse_sample_bank(
     bank: SparseSampleBank,
     val_ratio: float,
     split_seed: int,
-    importance_threshold: float,
-    iso_value: float,
-    iso_band: float,
-    surface_min: float,
-    surface_max: float,
 ) -> Tuple[SparseSampleBank, SparseSampleBank | None]:
     ratio = float(max(0.0, min(0.95, val_ratio)))
     count = int(bank.points.shape[0])
@@ -227,28 +171,13 @@ def split_sparse_sample_bank(
     val_idx = perm[:val_count]
     train_idx = perm[val_count:]
 
-    train_points = bank.points.index_select(0, train_idx)
-    train_density = bank.density.index_select(0, train_idx)
-    val_points = bank.points.index_select(0, val_idx)
-    val_density = bank.density.index_select(0, val_idx)
-
-    train_bank = build_sparse_sample_bank(
-        points=train_points,
-        density=train_density,
-        importance_threshold=importance_threshold,
-        iso_value=iso_value,
-        iso_band=iso_band,
-        surface_min=surface_min,
-        surface_max=surface_max,
+    train_bank = SparseSampleBank(
+        points=bank.points.index_select(0, train_idx),
+        density=bank.density.index_select(0, train_idx),
     )
-    val_bank = build_sparse_sample_bank(
-        points=val_points,
-        density=val_density,
-        importance_threshold=importance_threshold,
-        iso_value=iso_value,
-        iso_band=iso_band,
-        surface_min=surface_min,
-        surface_max=surface_max,
+    val_bank = SparseSampleBank(
+        points=bank.points.index_select(0, val_idx),
+        density=bank.density.index_select(0, val_idx),
     )
     return train_bank, val_bank
 
@@ -296,6 +225,140 @@ def sample_volume_trilinear(volume: torch.Tensor, points: torch.Tensor) -> torch
     return c0 * (1.0 - tz) + c1 * tz
 
 
+@torch.no_grad()
+def build_torus_coarse_density_grid(dim: int, device: torch.device) -> torch.Tensor:
+    dim_i = int(dim)
+    if dim_i < 8:
+        raise ValueError(f"coarse grid dim must be >= 8, got {dim_i}")
+    coords = torch.linspace(-1.0, 1.0, dim_i, device=device, dtype=torch.float32)
+    z_idx, y_idx, x_idx = torch.meshgrid(coords, coords, coords, indexing="ij")
+    points = torch.stack([x_idx.reshape(-1), y_idx.reshape(-1), z_idx.reshape(-1)], dim=-1)
+    density = torus_density(points)
+    return density.view(dim_i, dim_i, dim_i).contiguous()
+
+
+@torch.no_grad()
+def downsample_density_volume_to_grid(source_density_volume: torch.Tensor, dim: int) -> torch.Tensor:
+    dim_i = int(dim)
+    if dim_i < 8:
+        raise ValueError(f"coarse grid dim must be >= 8, got {dim_i}")
+    if source_density_volume.ndim != 3:
+        raise ValueError(
+            f"source density volume must be 3D [D,H,W], got shape={tuple(source_density_volume.shape)}"
+        )
+    coords = torch.linspace(-1.0, 1.0, dim_i, device=source_density_volume.device, dtype=torch.float32)
+    z_idx, y_idx, x_idx = torch.meshgrid(coords, coords, coords, indexing="ij")
+    points = torch.stack([x_idx.reshape(-1), y_idx.reshape(-1), z_idx.reshape(-1)], dim=-1)
+    sampled_density = sample_volume_trilinear(source_density_volume, points).clamp(0.0, 1.0)
+    return sampled_density.view(dim_i, dim_i, dim_i).contiguous()
+
+
+@torch.no_grad()
+def sample_detail_batch(
+    batch_size: int,
+    device: torch.device,
+    target_source: str,
+    target_volume: torch.Tensor | None,
+    target_sample_bank: SparseSampleBank | None,
+    coarse_density_grid: torch.Tensor,
+    coarse_inside_threshold: float,
+    importance_oversample: int,
+    importance_max_rounds: int,
+    sample_bank_inside_indices: torch.Tensor | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    inside_thr = float(max(0.0, min(1.0, coarse_inside_threshold)))
+    uniform_count = batch_size // 2
+    inside_count = batch_size - uniform_count
+
+    def sample_points_inside_grid(count: int) -> torch.Tensor:
+        selected_chunks: List[torch.Tensor] = []
+        selected_total = 0
+        rounds = 0
+        oversample = max(1, int(importance_oversample))
+        max_rounds = max(1, int(importance_max_rounds))
+        while selected_total < count and rounds < max_rounds:
+            remaining = count - selected_total
+            candidate_count = max(remaining * oversample, oversample)
+            candidates = torch.rand(candidate_count, 3, device=device) * 2.0 - 1.0
+            coarse = sample_volume_trilinear(coarse_density_grid, candidates).clamp(0.0, 1.0)
+            keep = candidates[coarse > inside_thr]
+            if keep.shape[0] > 0:
+                take = min(remaining, int(keep.shape[0]))
+                selected_chunks.append(keep[:take])
+                selected_total += take
+            rounds += 1
+        if selected_total < count:
+            selected_chunks.append(torch.rand(count - selected_total, 3, device=device) * 2.0 - 1.0)
+        return torch.cat(selected_chunks, dim=0)
+
+    if target_source in ("torus", "volume"):
+        point_chunks: List[torch.Tensor] = []
+        if uniform_count > 0:
+            point_chunks.append(torch.rand(uniform_count, 3, device=device) * 2.0 - 1.0)
+        if inside_count > 0:
+            point_chunks.append(sample_points_inside_grid(inside_count))
+        points = torch.cat(point_chunks, dim=0)
+        perm = torch.randperm(batch_size, device=device)
+        points = points[perm]
+        if target_source == "torus":
+            target_density = torus_density(points)
+        else:
+            if target_volume is None:
+                raise ValueError("target_volume must be provided when target_source='volume'")
+            target_density = sample_volume_trilinear(target_volume, points)
+        coarse_density = sample_volume_trilinear(coarse_density_grid, points).clamp(0.0, 1.0)
+        return points, target_density.unsqueeze(-1), coarse_density.unsqueeze(-1)
+
+    if target_source == "samples":
+        if target_sample_bank is None:
+            raise ValueError("target_sample_bank must be provided when target_source='samples'")
+        bank = target_sample_bank
+        sample_count = int(bank.points.shape[0])
+        if sample_count <= 0:
+            raise ValueError("sparse samples bank is empty")
+
+        point_chunks: List[torch.Tensor] = []
+        density_chunks: List[torch.Tensor] = []
+        if uniform_count > 0:
+            idx_uniform = torch.randint(0, sample_count, (uniform_count,), dtype=torch.long)
+            point_chunks.append(bank.points.index_select(0, idx_uniform).to(device=device))
+            density_chunks.append(bank.density.index_select(0, idx_uniform).to(device=device))
+
+        if inside_count > 0:
+            inside_pool = sample_bank_inside_indices
+            if inside_pool is not None and int(inside_pool.numel()) > 0:
+                pick = torch.randint(
+                    0,
+                    int(inside_pool.shape[0]),
+                    (inside_count,),
+                    dtype=torch.long,
+                    device=inside_pool.device,
+                )
+                idx_inside = inside_pool.index_select(0, pick)
+                if idx_inside.device != bank.points.device:
+                    idx_inside = idx_inside.to(device=bank.points.device)
+            else:
+                idx_inside = torch.randint(
+                    0,
+                    sample_count,
+                    (inside_count,),
+                    dtype=torch.long,
+                    device=bank.points.device,
+                )
+            point_chunks.append(bank.points.index_select(0, idx_inside).to(device=device))
+            density_chunks.append(bank.density.index_select(0, idx_inside).to(device=device))
+
+        points = torch.cat(point_chunks, dim=0)
+        target_density = torch.cat(density_chunks, dim=0)
+        perm = torch.randperm(batch_size, device=device)
+        points = points[perm]
+        target_density = target_density[perm]
+        coarse_density = sample_volume_trilinear(coarse_density_grid, points).clamp(0.0, 1.0)
+        return points, target_density.unsqueeze(-1), coarse_density.unsqueeze(-1)
+
+    raise ValueError(f"unsupported target_source '{target_source}'")
+
+
 class FourierEncoding(nn.Module):
     def __init__(self, levels: int = 4, include_input: bool = True) -> None:
         super().__init__()
@@ -318,8 +381,8 @@ class FourierEncoding(nn.Module):
         return torch.cat(out, dim=-1)
 
 
-class ResidualMLP(nn.Module):
-    def __init__(self, input_dim: int, hidden_sizes: Tuple[int, int] = (64, 64), output_dim: int = 1) -> None:
+class DetailMLP(nn.Module):
+    def __init__(self, input_dim: int, hidden_sizes: Tuple[int, int] = (128, 128), output_dim: int = 1) -> None:
         super().__init__()
         h0, h1 = hidden_sizes
         self.fc0 = nn.Linear(input_dim, h0)
@@ -342,258 +405,20 @@ class ResidualMLP(nn.Module):
         ]
 
 
-@torch.no_grad()
-def sample_batch(
-    batch_size: int,
-    device: torch.device,
-    target_source: str,
-    target_volume: torch.Tensor | None,
-    target_sample_bank: SparseSampleBank | None,
-    baseline_scale: float,
-    importance_ratio: float,
-    importance_threshold: float,
-    importance_oversample: int,
-    importance_max_rounds: int,
-    iso_shell_ratio: float,
-    surface_band_ratio: float,
-    iso_value: float,
-    iso_band: float,
-    surface_min: float,
-    surface_max: float,
-    residual_representation: str,
-    levelset_decode_k: float,
-    levelset_density_eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    def allocate_counts(batch: int, guided_r: float, shell_r: float, surface_r: float) -> Tuple[int, int, int, int]:
-        guided = int(batch * float(max(0.0, min(1.0, guided_r))))
-        shell = int(batch * float(max(0.0, min(1.0, shell_r))))
-        surface = int(batch * float(max(0.0, min(1.0, surface_r))))
-        overflow = guided + shell + surface - batch
-        if overflow > 0:
-            dec = min(guided, overflow)
-            guided -= dec
-            overflow -= dec
-        if overflow > 0:
-            dec = min(shell, overflow)
-            shell -= dec
-            overflow -= dec
-        if overflow > 0:
-            dec = min(surface, overflow)
-            surface -= dec
-            overflow -= dec
-        uniform = batch - guided - shell - surface
-        return uniform, guided, shell, surface
-
-    surface_lo = float(max(0.0, min(1.0, min(surface_min, surface_max))))
-    surface_hi = float(max(0.0, min(1.0, max(surface_min, surface_max))))
-
-    if target_source == "torus":
-        points = torch.rand(batch_size, 3, device=device) * 2.0 - 1.0
-        gt = torus_density(points)
-    elif target_source == "volume":
-        if target_volume is None:
-            raise ValueError("target_volume must be provided when target_source='volume'")
-
-        uniform_count, guided_count, shell_count, surface_count = allocate_counts(
-            batch_size,
-            importance_ratio,
-            iso_shell_ratio,
-            surface_band_ratio,
-        )
-
-        point_chunks: List[torch.Tensor] = []
-        if uniform_count > 0:
-            point_chunks.append(torch.rand(uniform_count, 3, device=device) * 2.0 - 1.0)
-
-        if guided_count > 0:
-            selected_chunks: List[torch.Tensor] = []
-            selected_total = 0
-            rounds = 0
-            oversample = max(1, int(importance_oversample))
-            max_rounds = max(1, int(importance_max_rounds))
-            threshold = float(max(0.0, importance_threshold))
-
-            while selected_total < guided_count and rounds < max_rounds:
-                remaining = guided_count - selected_total
-                candidate_count = max(remaining * oversample, oversample)
-                candidates = torch.rand(candidate_count, 3, device=device) * 2.0 - 1.0
-                candidate_gt = sample_volume_trilinear(target_volume, candidates)
-                keep = candidates[candidate_gt > threshold]
-                if keep.shape[0] > 0:
-                    take = min(remaining, keep.shape[0])
-                    selected_chunks.append(keep[:take])
-                    selected_total += take
-                rounds += 1
-
-            if selected_total < guided_count:
-                fill = torch.rand(guided_count - selected_total, 3, device=device) * 2.0 - 1.0
-                selected_chunks.append(fill)
-
-            point_chunks.append(torch.cat(selected_chunks, dim=0))
-
-        if shell_count > 0:
-            selected_chunks = []
-            selected_total = 0
-            rounds = 0
-            oversample = max(1, int(importance_oversample))
-            max_rounds = max(1, int(importance_max_rounds))
-            iso_center = float(max(0.0, min(1.0, iso_value)))
-            iso_width = max(1.0e-6, float(iso_band))
-
-            while selected_total < shell_count and rounds < max_rounds:
-                remaining = shell_count - selected_total
-                candidate_count = max(remaining * oversample, oversample)
-                candidates = torch.rand(candidate_count, 3, device=device) * 2.0 - 1.0
-                candidate_gt = sample_volume_trilinear(target_volume, candidates)
-                keep = candidates[torch.abs(candidate_gt - iso_center) <= iso_width]
-                if keep.shape[0] > 0:
-                    take = min(remaining, keep.shape[0])
-                    selected_chunks.append(keep[:take])
-                    selected_total += take
-                rounds += 1
-
-            if selected_total < shell_count:
-                fill = torch.rand(shell_count - selected_total, 3, device=device) * 2.0 - 1.0
-                selected_chunks.append(fill)
-
-            point_chunks.append(torch.cat(selected_chunks, dim=0))
-
-        if surface_count > 0:
-            selected_chunks = []
-            selected_total = 0
-            rounds = 0
-            oversample = max(1, int(importance_oversample))
-            max_rounds = max(1, int(importance_max_rounds))
-
-            while selected_total < surface_count and rounds < max_rounds:
-                remaining = surface_count - selected_total
-                candidate_count = max(remaining * oversample, oversample)
-                candidates = torch.rand(candidate_count, 3, device=device) * 2.0 - 1.0
-                candidate_gt = sample_volume_trilinear(target_volume, candidates)
-                keep = candidates[(candidate_gt >= surface_lo) & (candidate_gt <= surface_hi)]
-                if keep.shape[0] > 0:
-                    take = min(remaining, keep.shape[0])
-                    selected_chunks.append(keep[:take])
-                    selected_total += take
-                rounds += 1
-
-            if selected_total < surface_count:
-                fill = torch.rand(surface_count - selected_total, 3, device=device) * 2.0 - 1.0
-                selected_chunks.append(fill)
-
-            point_chunks.append(torch.cat(selected_chunks, dim=0))
-
-        points = torch.cat(point_chunks, dim=0)
-        if points.shape[0] != batch_size:
-            raise RuntimeError(f"sampled unexpected point count {points.shape[0]}, expected {batch_size}")
-
-        # Keep stochastic ordering to avoid chunk-order bias between uniform and guided subsets.
-        perm = torch.randperm(batch_size, device=device)
-        points = points[perm]
-        gt = sample_volume_trilinear(target_volume, points)
-    elif target_source == "samples":
-        if target_sample_bank is None:
-            raise ValueError("target_sample_bank must be provided when target_source='samples'")
-
-        bank = target_sample_bank
-        sample_count = int(bank.points.shape[0])
-        if sample_count <= 0:
-            raise ValueError("sparse samples bank is empty")
-
-        uniform_count, guided_count, shell_count, surface_count = allocate_counts(
-            batch_size,
-            importance_ratio,
-            iso_shell_ratio,
-            surface_band_ratio,
-        )
-
-        point_chunks: List[torch.Tensor] = []
-        gt_chunks: List[torch.Tensor] = []
-
-        if uniform_count > 0:
-            idx_uniform = torch.randint(0, sample_count, (uniform_count,), dtype=torch.long)
-            point_chunks.append(bank.points.index_select(0, idx_uniform).to(device=device))
-            gt_chunks.append(bank.density.index_select(0, idx_uniform).to(device=device))
-
-        if guided_count > 0:
-            guided_pool = bank.guided_indices
-            if guided_pool.numel() > 0:
-                pick = torch.randint(0, int(guided_pool.shape[0]), (guided_count,), dtype=torch.long)
-                idx_guided = guided_pool.index_select(0, pick)
-            else:
-                idx_guided = torch.randint(0, sample_count, (guided_count,), dtype=torch.long)
-            point_chunks.append(bank.points.index_select(0, idx_guided).to(device=device))
-            gt_chunks.append(bank.density.index_select(0, idx_guided).to(device=device))
-
-        if shell_count > 0:
-            shell_pool = bank.shell_indices
-            if shell_pool.numel() > 0:
-                pick = torch.randint(0, int(shell_pool.shape[0]), (shell_count,), dtype=torch.long)
-                idx_shell = shell_pool.index_select(0, pick)
-            else:
-                idx_shell = torch.randint(0, sample_count, (shell_count,), dtype=torch.long)
-            point_chunks.append(bank.points.index_select(0, idx_shell).to(device=device))
-            gt_chunks.append(bank.density.index_select(0, idx_shell).to(device=device))
-
-        if surface_count > 0:
-            surface_pool = bank.surface_indices
-            if surface_pool.numel() > 0:
-                pick = torch.randint(0, int(surface_pool.shape[0]), (surface_count,), dtype=torch.long)
-                idx_surface = surface_pool.index_select(0, pick)
-            else:
-                idx_surface = torch.randint(0, sample_count, (surface_count,), dtype=torch.long)
-            point_chunks.append(bank.points.index_select(0, idx_surface).to(device=device))
-            gt_chunks.append(bank.density.index_select(0, idx_surface).to(device=device))
-
-        points = torch.cat(point_chunks, dim=0)
-        gt = torch.cat(gt_chunks, dim=0)
-        if points.shape[0] != batch_size:
-            raise RuntimeError(f"sampled unexpected point count {points.shape[0]}, expected {batch_size}")
-
-        # Keep stochastic ordering to avoid chunk-order bias between uniform and guided subsets.
-        perm = torch.randperm(batch_size, device=device)
-        points = points[perm]
-        gt = gt[perm]
-    else:
-        raise ValueError(f"unsupported target_source '{target_source}'")
-    if residual_representation == "levelset":
-        baseline_field = baseline_scale * sdf_box(points)
-        target_field = density_to_phi(
-            gt,
-            iso_value=iso_value,
-            decode_k=levelset_decode_k,
-            eps=levelset_density_eps,
-        )
-    else:
-        baseline_field = baseline_scale * box_density(points)
-        target_field = gt
-
-    residual = (target_field - baseline_field).unsqueeze(-1)
-    return points, residual, gt.unsqueeze(-1), baseline_field.unsqueeze(-1)
-
-
-def residual_loss_terms(
-    pred_residual: torch.Tensor,
-    target_residual: torch.Tensor,
-    target_density: torch.Tensor,
-    abs_weight_scale: float,
-    l1_coeff: float,
-    iso_value: float,
-    iso_band: float,
-    iso_loss_weight: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    mse = F.mse_loss(pred_residual, target_residual)
-    weight = 1.0 + max(0.0, float(abs_weight_scale)) * torch.abs(target_residual)
-    if iso_loss_weight > 0.0:
-        band = max(1.0e-4, float(iso_band))
-        iso_center = float(max(0.0, min(1.0, iso_value)))
-        shell = torch.exp(-((target_density - iso_center) / band).square())
-        weight = weight * (1.0 + float(iso_loss_weight) * shell)
-    weighted_mse = (weight * (pred_residual - target_residual).square()).mean()
-    l1 = F.l1_loss(pred_residual, target_residual)
-    weighted_l1 = (weight * torch.abs(pred_residual - target_residual)).mean()
-    objective = weighted_mse + max(0.0, float(l1_coeff)) * weighted_l1
-    return objective, mse, l1
+def gradient_regularization(pred_detail: torch.Tensor, points: torch.Tensor, coeff: float) -> torch.Tensor:
+    c = float(max(0.0, coeff))
+    if c <= 0.0:
+        return pred_detail.new_zeros(())
+    grad_outputs = torch.ones_like(pred_detail)
+    grads = torch.autograd.grad(
+        outputs=pred_detail,
+        inputs=points,
+        grad_outputs=grad_outputs,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+    return c * torch.mean(torch.sum(grads * grads, dim=-1))
 
 
 def cosine_lr(step: int, max_steps: int, lr_start: float, lr_final: float, warmup_steps: int) -> float:
@@ -609,79 +434,16 @@ def cosine_lr(step: int, max_steps: int, lr_start: float, lr_final: float, warmu
     return lr_final + (lr_start - lr_final) * c
 
 
-def empty_space_leak_penalty(
-    pred_density: torch.Tensor,
-    target_density: torch.Tensor,
-    empty_density_threshold: float,
-    coeff: float,
-) -> torch.Tensor:
-    if coeff <= 0.0:
-        return pred_density.new_zeros(())
-    thr = float(max(0.0, min(1.0, empty_density_threshold)))
-    empty_mask = (target_density <= thr).to(pred_density.dtype)
-    empty_count = torch.sum(empty_mask)
-    if float(empty_count.item()) < 1.0:
-        return pred_density.new_zeros(())
-    leak = torch.relu(pred_density - thr)
-    return float(coeff) * torch.sum(empty_mask * leak.square()) / empty_count
-
-
-def gradient_regularization(
-    pred_residual: torch.Tensor,
-    points: torch.Tensor,
-    coeff: float,
-) -> torch.Tensor:
-    if coeff <= 0.0:
-        return pred_residual.new_zeros(())
-    grads = torch.autograd.grad(pred_residual.sum(), points, create_graph=True)[0]
-    return float(coeff) * grads.square().mean()
-
-
-def combine_residual_channels(
-    pred_raw: torch.Tensor,
-    low_scale: float,
-    high_scale: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if pred_raw.shape[-1] < 1:
-        raise ValueError(f"pred_raw must have at least one channel, got shape={tuple(pred_raw.shape)}")
-    low_raw = pred_raw[:, 0:1]
-    high_raw = pred_raw[:, 1:2] if pred_raw.shape[-1] > 1 else torch.zeros_like(low_raw)
-    low_term = float(low_scale) * low_raw
-    high_term = float(high_scale) * high_raw
-    return low_term + high_term, low_term, high_term
-
-
-def high_surface_residual_loss(
-    pred_high_term: torch.Tensor,
-    target_residual: torch.Tensor,
-    target_density: torch.Tensor,
-    surface_min: float,
-    surface_max: float,
-    coeff: float,
-) -> torch.Tensor:
-    if coeff <= 0.0:
-        return pred_high_term.new_zeros(())
-    smin = float(max(0.0, min(1.0, min(surface_min, surface_max))))
-    smax = float(max(0.0, min(1.0, max(surface_min, surface_max))))
-    mask = ((target_density >= smin) & (target_density <= smax)).to(pred_high_term.dtype)
-    count = torch.sum(mask)
-    if float(count.item()) < 1.0:
-        return pred_high_term.new_zeros(())
-    err = (pred_high_term - target_residual).square()
-    return float(coeff) * torch.sum(mask * err) / count
-
-
-def export_model(
-    model: ResidualMLP,
+def export_detail_density_model(
+    model: DetailMLP,
     encoding_levels: int,
     ground_truth_info: Dict[str, Any],
-    baseline_scale: float,
-    residual_representation: str,
-    levelset_decode_k: float,
-    levelset_density_eps: float,
-    levelset_iso_value: float,
-    residual_low_scale: float,
-    residual_high_scale: float,
+    detail_amplitude: float,
+    fade_start: float,
+    fade_end: float,
+    coarse_bin_name: str,
+    coarse_meta_name: str,
+    coarse_dims: Tuple[int, int, int],
     output_dir: Path,
     weights_name: str = "residual_mlp_weights.bin",
     meta_name: str = "residual_mlp_metadata.json",
@@ -708,24 +470,10 @@ def export_model(
 
     weights_path.write_bytes(blob)
 
-    if residual_representation == "levelset":
-        baseline_type = "sdf_box"
-        reconstruction_info = {
-            "type": "sigmoid_levelset",
-            "iso_value": float(levelset_iso_value),
-            "decode_k": float(levelset_decode_k),
-            "density_epsilon": float(levelset_density_eps),
-        }
-    else:
-        baseline_type = "smooth_box"
-        reconstruction_info = {
-            "type": "additive_density_residual",
-        }
-
     metadata = {
         "layout": "[W0][b0][W1][b1][W2][b2]",
         "dtype": "float32",
-        "residual_representation": residual_representation,
+        "training_mode": "detail_only_density",
         "encoding": {
             "type": "fourier",
             "levels": encoding_levels,
@@ -745,20 +493,19 @@ def export_model(
                 int(model.fc2.out_features),
             ]
         },
-        "residual_decomposition": {
-            "type": "two_channel_additive",
-            "channels": int(model.fc2.out_features),
-            "low_scale": float(residual_low_scale),
-            "high_scale": float(residual_high_scale),
+        "reconstruction": {
+            "type": "coarse_plus_detail_tanh",
+            "detail_amplitude": float(max(1.0e-6, detail_amplitude)),
+            "detail_fade_start": float(max(0.0, fade_start)),
+            "detail_fade_end": float(max(fade_start + 1.0e-6, fade_end)),
         },
-        "baseline": {
-            "type": baseline_type,
-            "half_extents": list(BOX_HALF_EXTENTS),
-            "sharpness": BOX_SHARPNESS,
-            "scale": baseline_scale,
-            "sdf_scale": baseline_scale,
+        "geometry": {
+            "type": "coarse_density_volume",
+            "bin": str(coarse_bin_name),
+            "meta": str(coarse_meta_name),
+            "dims": [int(coarse_dims[0]), int(coarse_dims[1]), int(coarse_dims[2])],
+            "domain": "[-1,1]^3",
         },
-        "reconstruction": reconstruction_info,
         "ground_truth": ground_truth_info,
         "offsets": offsets,
         "counts": counts,
@@ -777,6 +524,7 @@ def copy_exports_to_viz(
     dest_dir: Path,
     weights_name: str,
     meta_name: str,
+    extra_filenames: List[str] | None = None,
 ) -> None:
     weights_src = source_dir / weights_name
     meta_src = source_dir / meta_name
@@ -788,140 +536,97 @@ def copy_exports_to_viz(
     dest_dir.mkdir(parents=True, exist_ok=True)
     weights_dst = dest_dir / weights_name
     meta_dst = dest_dir / meta_name
-
     shutil.copy2(weights_src, weights_dst)
     shutil.copy2(meta_src, meta_dst)
 
     print(f"Copied weights to viz:  {weights_dst}")
     print(f"Copied metadata to viz: {meta_dst}")
 
+    if extra_filenames:
+        for name in extra_filenames:
+            rel = Path(name)
+            src = source_dir / rel
+            if not src.exists():
+                raise FileNotFoundError(f"Missing extra export file for copy: {src}")
+            dst = dest_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            print(f"Copied extra artifact to viz: {dst}")
+
 
 def train(args: argparse.Namespace) -> None:
+    if str(args.training_mode).strip().lower() != "detail_only_density":
+        raise ValueError("Legacy training modes were removed. Use --training-mode detail_only_density.")
+
     torch.manual_seed(args.seed)
     if args.fourier_levels < 1:
-        raise ValueError("fourier_levels must be >= 1 to enable positional encoding.")
+        raise ValueError("--fourier-levels must be >= 1.")
     if len(args.hidden_layers) != 2:
-        raise ValueError("--hidden-layers must provide exactly 2 integers, e.g. --hidden-layers 192 192")
+        raise ValueError("--hidden-layers must provide exactly 2 integers, e.g. --hidden-layers 128 128")
     hidden0 = int(args.hidden_layers[0])
     hidden1 = int(args.hidden_layers[1])
     if hidden0 <= 0 or hidden1 <= 0:
         raise ValueError(f"--hidden-layers values must be > 0, got {args.hidden_layers}")
-    if args.residual_channels not in (1, 2):
-        raise ValueError(f"--residual-channels must be 1 or 2, got {args.residual_channels}")
-    if args.residual_low_scale <= 0:
-        raise ValueError(f"--residual-low-scale must be > 0, got {args.residual_low_scale}")
-    if args.residual_high_scale < 0:
-        raise ValueError(f"--residual-high-scale must be >= 0, got {args.residual_high_scale}")
-    if args.baseline_scale <= 0:
-        raise ValueError(f"--baseline-scale must be > 0, got {args.baseline_scale}")
-    if args.target_field not in ("density", "levelset"):
-        raise ValueError(f"--target-field must be one of ['density', 'levelset'], got {args.target_field}")
-    if args.levelset_decode_k <= 0:
-        raise ValueError(f"--levelset-decode-k must be > 0, got {args.levelset_decode_k}")
-    if args.levelset_density_eps <= 0 or args.levelset_density_eps >= 0.25:
-        raise ValueError(f"--levelset-density-eps must be in (0, 0.25), got {args.levelset_density_eps}")
-    if args.grad_reg_coeff < 0:
-        raise ValueError(f"--grad-reg-coeff must be >= 0, got {args.grad_reg_coeff}")
-    if args.loss_weight_abs_scale < 0:
-        raise ValueError(f"--loss-weight-abs-scale must be >= 0, got {args.loss_weight_abs_scale}")
-    if args.loss_l1_coeff < 0:
-        raise ValueError(f"--loss-l1-coeff must be >= 0, got {args.loss_l1_coeff}")
-    if args.lr <= 0:
-        raise ValueError(f"--lr must be > 0, got {args.lr}")
-    if args.lr_final <= 0:
-        raise ValueError(f"--lr-final must be > 0, got {args.lr_final}")
-    if args.lr_warmup_steps < 0:
-        raise ValueError(f"--lr-warmup-steps must be >= 0, got {args.lr_warmup_steps}")
-    if args.loss_ramp_steps < 1:
-        raise ValueError(f"--loss-ramp-steps must be >= 1, got {args.loss_ramp_steps}")
-    if args.iso_shell_ratio < 0 or args.iso_shell_ratio > 1:
-        raise ValueError(f"--iso-shell-ratio must be in [0,1], got {args.iso_shell_ratio}")
-    if args.surface_band_ratio < 0 or args.surface_band_ratio > 1:
-        raise ValueError(f"--surface-band-ratio must be in [0,1], got {args.surface_band_ratio}")
+    if args.detail_amplitude <= 0:
+        raise ValueError(f"--detail-amplitude must be > 0, got {args.detail_amplitude}")
+    if args.detail_grid_dim < 8:
+        raise ValueError(f"--detail-grid-dim must be >= 8, got {args.detail_grid_dim}")
+    if args.detail_inside_threshold < 0 or args.detail_inside_threshold > 1:
+        raise ValueError(f"--detail-inside-threshold must be in [0,1], got {args.detail_inside_threshold}")
+    if args.detail_shell_boost < 0:
+        raise ValueError(f"--detail-shell-boost must be >= 0, got {args.detail_shell_boost}")
+    if args.detail_smoothness_coeff < 0:
+        raise ValueError(f"--detail-smoothness-coeff must be >= 0, got {args.detail_smoothness_coeff}")
+    if args.detail_fade_start < 0 or args.detail_fade_start > 1:
+        raise ValueError(f"--detail-fade-start must be in [0,1], got {args.detail_fade_start}")
+    if args.detail_fade_end < 0 or args.detail_fade_end > 1:
+        raise ValueError(f"--detail-fade-end must be in [0,1], got {args.detail_fade_end}")
+    if args.detail_fade_end <= args.detail_fade_start:
+        raise ValueError(
+            f"--detail-fade-end must be > --detail-fade-start, got {args.detail_fade_end} <= {args.detail_fade_start}"
+        )
     if args.iso_value < 0 or args.iso_value > 1:
         raise ValueError(f"--iso-value must be in [0,1], got {args.iso_value}")
     if args.iso_band <= 0:
         raise ValueError(f"--iso-band must be > 0, got {args.iso_band}")
-    if args.surface_band_min < 0 or args.surface_band_min > 1:
-        raise ValueError(f"--surface-band-min must be in [0,1], got {args.surface_band_min}")
-    if args.surface_band_max < 0 or args.surface_band_max > 1:
-        raise ValueError(f"--surface-band-max must be in [0,1], got {args.surface_band_max}")
-    if args.surface_band_min >= args.surface_band_max:
-        raise ValueError(
-            f"--surface-band-min must be < --surface-band-max, got {args.surface_band_min} >= {args.surface_band_max}"
-        )
-    if args.loss_iso_weight < 0:
-        raise ValueError(f"--loss-iso-weight must be >= 0, got {args.loss_iso_weight}")
-    if args.empty_density_threshold < 0 or args.empty_density_threshold > 1:
-        raise ValueError(
-            f"--empty-density-threshold must be in [0,1], got {args.empty_density_threshold}"
-        )
-    if args.loss_empty_space_weight < 0:
-        raise ValueError(
-            f"--loss-empty-space-weight must be >= 0, got {args.loss_empty_space_weight}"
-        )
-    if args.loss_high_surface_weight < 0:
-        raise ValueError(
-            f"--loss-high-surface-weight must be >= 0, got {args.loss_high_surface_weight}"
-        )
     if args.val_ratio < 0 or args.val_ratio >= 1:
         raise ValueError(f"--val-ratio must be in [0,1), got {args.val_ratio}")
+    if args.lr <= 0 or args.lr_final <= 0:
+        raise ValueError(f"--lr and --lr-final must be > 0, got lr={args.lr}, lr_final={args.lr_final}")
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"Device: {device}")
+    print("Training mode: detail_only_density")
     print(
-        "Encoding: include_input=True, levels="
-        f"{args.fourier_levels}, order=input_xyz_then_per_level_sin_xyz_cos_xyz, freq=2**i (no 2pi)"
+        "Model: "
+        f"fourier_levels={args.fourier_levels}, hidden=[{hidden0}, {hidden1}], output=tanh(detail)"
     )
-    print(f"MLP hidden layers: [{hidden0}, {hidden1}]")
     print(
-        "Residual decomposition: "
-        f"channels={args.residual_channels}, "
-        f"low_scale={args.residual_low_scale:.3f}, "
-        f"high_scale={args.residual_high_scale:.3f}"
+        "Detail reconstruction: "
+        f"amplitude={args.detail_amplitude:.4f}, "
+        f"inside_threshold={args.detail_inside_threshold:.4f}, "
+        f"grid_dim={args.detail_grid_dim}, "
+        f"fade=[{args.detail_fade_start:.3f}, {args.detail_fade_end:.3f}]"
     )
     print(
         "Sampling: "
-        f"importance_ratio={args.importance_ratio:.2f}, "
-        f"importance_threshold={args.importance_threshold:.3f}, "
-        f"iso_shell_ratio={args.iso_shell_ratio:.2f}, "
-        f"surface_band_ratio={args.surface_band_ratio:.2f}, "
-        f"iso_value={args.iso_value:.3f}, "
-        f"iso_band={args.iso_band:.3f}, "
-        f"surface_band=[{args.surface_band_min:.3f}, {args.surface_band_max:.3f}], "
+        "uniform_ratio=0.50, inside_ratio=0.50, "
         f"importance_oversample={args.importance_oversample}, "
         f"importance_max_rounds={args.importance_max_rounds}"
     )
     print(
         "Loss: "
-        f"weighted_mse_abs_scale={args.loss_weight_abs_scale:.3f}, "
-        f"l1_coeff={args.loss_l1_coeff:.3f}, "
-        f"iso_weight={args.loss_iso_weight:.3f}, "
-        f"high_surface_weight={args.loss_high_surface_weight:.3f}, "
-        f"empty_thr={args.empty_density_threshold:.3f}, "
-        f"empty_weight={args.loss_empty_space_weight:.3f}, "
-        f"grad_reg_coeff={args.grad_reg_coeff:.6f}"
+        f"shell_boost={args.detail_shell_boost:.3f}, "
+        f"iso=[{args.iso_value:.3f}, band={args.iso_band:.3f}], "
+        f"smoothness_coeff={args.detail_smoothness_coeff:.6f}"
     )
-    print(
-        "Optimizer: "
-        f"lr_start={args.lr:.6f}, lr_final={args.lr_final:.6f}, "
-        f"lr_warmup_steps={args.lr_warmup_steps}, loss_ramp_steps={args.loss_ramp_steps}"
-    )
-    if args.target_field == "levelset":
-        print(
-            "Target field: levelset residual "
-            f"(iso={args.iso_value:.3f}, decode_k={args.levelset_decode_k:.3f}, eps={args.levelset_density_eps:.1e})"
-        )
-        print(f"Baseline: sdf_box scale={args.baseline_scale:.3f}")
-    else:
-        print("Target field: density residual (additive)")
-        print(f"Baseline: smooth_box scale={args.baseline_scale:.3f}, sharpness={BOX_SHARPNESS:.3f}")
 
     target_source = str(args.target_source).strip().lower()
     target_volume: torch.Tensor | None = None
     train_sample_bank: SparseSampleBank | None = None
     eval_sample_bank: SparseSampleBank | None = None
     ground_truth_info: Dict[str, Any]
+
     if target_source == "torus":
         ground_truth_info = {
             "type": "smooth_torus",
@@ -936,17 +641,15 @@ def train(args: argparse.Namespace) -> None:
         volume_bin_path = Path(args.volume_bin)
         volume_meta_path = Path(args.volume_meta) if args.volume_meta else None
         target_volume, volume_meta = load_dense_volume(volume_bin_path, volume_meta_path, device=device)
-        volume_min = float(target_volume.min().item())
-        volume_max = float(target_volume.max().item())
-        volume_mean = float(target_volume.mean().item())
         print(
-            f"Target source: volume ({volume_bin_path}), "
-            f"dims={list(target_volume.shape)}, min={volume_min:.6f}, max={volume_max:.6f}, mean={volume_mean:.6f}"
+            f"Target source: volume ({volume_bin_path}), dims={list(target_volume.shape)}, "
+            f"min={float(target_volume.min().item()):.6f}, max={float(target_volume.max().item()):.6f}, "
+            f"mean={float(target_volume.mean().item()):.6f}"
         )
         ground_truth_info = {
             "type": "dense_volume",
             "bin_path": str(volume_bin_path),
-            "meta_path": str(volume_meta_path if volume_meta_path is not None else volume_bin_path.with_suffix('.json')),
+            "meta_path": str(volume_meta_path if volume_meta_path is not None else volume_bin_path.with_suffix(".json")),
             "dims": list(target_volume.shape),
             "meta": volume_meta,
         }
@@ -955,71 +658,88 @@ def train(args: argparse.Namespace) -> None:
             raise ValueError("--samples-bin is required when --target-source=samples")
         samples_bin_path = Path(args.samples_bin)
         samples_meta_path = Path(args.samples_meta) if args.samples_meta else None
-        loaded_bank, samples_meta = load_sparse_samples(
-            samples_bin_path=samples_bin_path,
-            samples_meta_path=samples_meta_path,
-            importance_threshold=args.importance_threshold,
-            iso_value=args.iso_value,
-            iso_band=args.iso_band,
-            surface_min=args.surface_band_min,
-            surface_max=args.surface_band_max,
-        )
-        sample_min = float(loaded_bank.density.min().item())
-        sample_max = float(loaded_bank.density.max().item())
-        sample_mean = float(loaded_bank.density.mean().item())
-        sample_count = int(loaded_bank.points.shape[0])
-        guided_count = int(loaded_bank.guided_indices.shape[0])
-        shell_count = int(loaded_bank.shell_indices.shape[0])
-        surface_count = int(loaded_bank.surface_indices.shape[0])
+        loaded_bank, samples_meta = load_sparse_samples(samples_bin_path=samples_bin_path, samples_meta_path=samples_meta_path)
         train_sample_bank, eval_sample_bank = split_sparse_sample_bank(
             bank=loaded_bank,
             val_ratio=args.val_ratio,
             split_seed=args.seed + 1337,
-            importance_threshold=args.importance_threshold,
-            iso_value=args.iso_value,
-            iso_band=args.iso_band,
-            surface_min=args.surface_band_min,
-            surface_max=args.surface_band_max,
         )
         train_count = int(train_sample_bank.points.shape[0])
-        if eval_sample_bank is not None:
-            eval_count = int(eval_sample_bank.points.shape[0])
-            print(
-                f"Sample split: train={train_count}, test={eval_count}, val_ratio={args.val_ratio:.3f}"
-            )
-        else:
-            print(f"Sample split: train={train_count}, test=none")
-        print(
-            f"Target source: samples ({samples_bin_path}), "
-            f"count={sample_count}, guided_count={guided_count}, shell_count={shell_count}, "
-            f"surface_count={surface_count}, "
-            f"min={sample_min:.6f}, max={sample_max:.6f}, mean={sample_mean:.6f}"
-        )
+        eval_count = int(eval_sample_bank.points.shape[0]) if eval_sample_bank is not None else 0
+        print(f"Target source: samples ({samples_bin_path}), train={train_count}, test={eval_count}")
         ground_truth_info = {
             "type": "sparse_samples",
             "bin_path": str(samples_bin_path),
-            "meta_path": str(samples_meta_path if samples_meta_path is not None else samples_bin_path.with_suffix('.json')),
-            "count": sample_count,
-            "guided_count": guided_count,
-            "shell_count": shell_count,
-            "surface_count": surface_count,
+            "meta_path": str(samples_meta_path if samples_meta_path is not None else samples_bin_path.with_suffix(".json")),
+            "count": int(loaded_bank.points.shape[0]),
             "train_count": train_count,
-            "test_count": int(eval_sample_bank.points.shape[0]) if eval_sample_bank is not None else 0,
+            "test_count": eval_count,
             "val_ratio": float(args.val_ratio),
             "meta": samples_meta,
         }
     else:
         raise ValueError(f"--target-source must be one of ['torus', 'volume', 'samples'], got '{args.target_source}'")
 
+    if target_source == "torus":
+        coarse_density_grid = build_torus_coarse_density_grid(args.detail_grid_dim, device=device)
+        coarse_source_info: Dict[str, Any] = {
+            "source": "analytic_torus",
+            "dims": [int(v) for v in coarse_density_grid.shape],
+        }
+    elif target_source == "volume" and target_volume is not None:
+        coarse_density_grid = downsample_density_volume_to_grid(target_volume, args.detail_grid_dim)
+        coarse_source_info = {
+            "source": "target_volume_downsampled",
+            "dims": [int(v) for v in coarse_density_grid.shape],
+        }
+    else:
+        source_bin = Path(args.coarse_grid_source_bin)
+        source_meta = Path(args.coarse_grid_source_meta) if args.coarse_grid_source_meta else None
+        source_volume, source_meta_json = load_dense_volume(source_bin, source_meta, device=device, clamp_to_unit=True)
+        coarse_density_grid = downsample_density_volume_to_grid(source_volume, args.detail_grid_dim)
+        coarse_source_info = {
+            "source": "explicit_source_volume",
+            "source_bin": str(source_bin),
+            "source_meta": str(source_meta if source_meta is not None else source_bin.with_suffix(".json")),
+            "source_dims": [int(v) for v in source_volume.shape],
+            "source_meta_json": source_meta_json,
+            "dims": [int(v) for v in coarse_density_grid.shape],
+        }
+
+    print(
+        f"Coarse grid: dims={list(coarse_density_grid.shape)}, "
+        f"min={float(coarse_density_grid.min().item()):.6f}, "
+        f"max={float(coarse_density_grid.max().item()):.6f}, "
+        f"mean={float(coarse_density_grid.mean().item()):.6f}"
+    )
+
+    inside_thr = float(max(0.0, min(1.0, args.detail_inside_threshold)))
+    train_inside_indices: torch.Tensor | None = None
+    eval_inside_indices: torch.Tensor | None = None
+    if target_source == "samples" and train_sample_bank is not None:
+        train_coarse = sample_volume_trilinear(coarse_density_grid, train_sample_bank.points.to(device=device)).clamp(0.0, 1.0)
+        train_inside_indices = torch.nonzero(train_coarse > inside_thr, as_tuple=False).squeeze(1).to(torch.long)
+        if eval_sample_bank is not None:
+            eval_coarse = sample_volume_trilinear(coarse_density_grid, eval_sample_bank.points.to(device=device)).clamp(0.0, 1.0)
+            eval_inside_indices = torch.nonzero(eval_coarse > inside_thr, as_tuple=False).squeeze(1).to(torch.long)
+        print(
+            "Samples inside-coarse pool: "
+            f"train_inside={int(train_inside_indices.shape[0])}, "
+            f"test_inside={int(eval_inside_indices.shape[0]) if eval_inside_indices is not None else 0}"
+        )
+
     encoder = FourierEncoding(levels=args.fourier_levels).to(device)
-    model = ResidualMLP(
+    model = DetailMLP(
         input_dim=encoder.output_dim,
         hidden_sizes=(hidden0, hidden1),
-        output_dim=int(args.residual_channels),
+        output_dim=1,
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    ema_mse = None
+    amp = float(args.detail_amplitude)
+    iso_center = float(max(0.0, min(1.0, args.iso_value)))
+    iso_width = float(max(1.0e-4, args.iso_band))
+    ema_density_mse = None
     stop_step = args.max_steps
 
     for step in range(1, args.max_steps + 1):
@@ -1033,230 +753,150 @@ def train(args: argparse.Namespace) -> None:
         for group in optimizer.param_groups:
             group["lr"] = lr_now
 
-        ramp_denom = max(1, int(args.loss_ramp_steps))
-        loss_ramp = min(1.0, float(step) / float(ramp_denom))
-        abs_weight_scale_eff = args.loss_weight_abs_scale * loss_ramp
-        iso_weight_eff = args.loss_iso_weight * loss_ramp
-        empty_weight_eff = args.loss_empty_space_weight * loss_ramp
-        high_surface_weight_eff = (args.loss_high_surface_weight * loss_ramp) if args.residual_channels > 1 else 0.0
-
-        points, target_residual, target_density, baseline_field = sample_batch(
+        points, target_density, coarse_density = sample_detail_batch(
             batch_size=args.batch_size,
             device=device,
             target_source=target_source,
             target_volume=target_volume,
             target_sample_bank=train_sample_bank,
-            baseline_scale=args.baseline_scale,
-            importance_ratio=args.importance_ratio,
-            importance_threshold=args.importance_threshold,
+            coarse_density_grid=coarse_density_grid,
+            coarse_inside_threshold=inside_thr,
             importance_oversample=args.importance_oversample,
             importance_max_rounds=args.importance_max_rounds,
-            iso_shell_ratio=args.iso_shell_ratio,
-            surface_band_ratio=args.surface_band_ratio,
-            iso_value=args.iso_value,
-            iso_band=args.iso_band,
-            surface_min=args.surface_band_min,
-            surface_max=args.surface_band_max,
-            residual_representation=args.target_field,
-            levelset_decode_k=args.levelset_decode_k,
-            levelset_density_eps=args.levelset_density_eps,
+            sample_bank_inside_indices=train_inside_indices,
         )
-        points.requires_grad_(args.grad_reg_coeff > 0.0)
-        encoded = encoder(points)
-        pred_raw = model(encoded)
-        pred_residual, pred_low_term, pred_high_term = combine_residual_channels(
-            pred_raw,
-            low_scale=args.residual_low_scale,
-            high_scale=args.residual_high_scale,
-        )
-        pred_field = baseline_field + pred_residual
-        if args.target_field == "levelset":
-            pred_density = phi_to_density(
-                pred_field,
-                iso_value=args.iso_value,
-                decode_k=args.levelset_decode_k,
-            )
-        else:
-            pred_density = torch.clamp(pred_field, 0.0, 1.0)
+        points.requires_grad_(args.detail_smoothness_coeff > 0.0)
+        pred_detail = torch.tanh(model(encoder(points)))
 
-        data_objective, mse, l1 = residual_loss_terms(
-            pred_residual=pred_residual,
-            target_residual=target_residual,
-            target_density=target_density,
-            abs_weight_scale=abs_weight_scale_eff,
-            l1_coeff=args.loss_l1_coeff,
-            iso_value=args.iso_value,
-            iso_band=args.iso_band,
-            iso_loss_weight=iso_weight_eff,
-        )
-        grad_reg = gradient_regularization(
-            pred_residual=pred_residual,
-            points=points,
-            coeff=args.grad_reg_coeff,
-        )
-        empty_leak = empty_space_leak_penalty(
-            pred_density=pred_density,
-            target_density=target_density,
-            empty_density_threshold=args.empty_density_threshold,
-            coeff=empty_weight_eff,
-        )
-        high_surface = high_surface_residual_loss(
-            pred_high_term=pred_high_term,
-            target_residual=target_residual,
-            target_density=target_density,
-            surface_min=args.surface_band_min,
-            surface_max=args.surface_band_max,
-            coeff=high_surface_weight_eff,
-        )
-        objective = data_objective + grad_reg + empty_leak + high_surface
+        target_detail = torch.clamp((target_density - coarse_density) / amp, -1.0, 1.0)
+        target_detail = torch.where(coarse_density > inside_thr, target_detail, torch.zeros_like(target_detail))
+
+        shell = torch.exp(-((target_density - iso_center) / iso_width).square())
+        weight = 1.0 + float(args.detail_shell_boost) * shell
+        detail_mse = torch.mean(weight * (pred_detail - target_detail).square())
+        smoothness = gradient_regularization(pred_detail=pred_detail, points=points, coeff=args.detail_smoothness_coeff)
+        objective = detail_mse + smoothness
 
         optimizer.zero_grad(set_to_none=True)
         objective.backward()
         optimizer.step()
 
-        objective_val = float(objective.item())
-        data_objective_val = float(data_objective.item())
-        grad_reg_val = float(grad_reg.item())
-        empty_leak_val = float(empty_leak.item())
-        high_surface_val = float(high_surface.item())
-        mse_val = float(mse.item())
-        l1_val = float(l1.item())
-        ema_mse = mse_val if ema_mse is None else (0.98 * ema_mse + 0.02 * mse_val)
+        pred_density = torch.clamp(coarse_density + amp * pred_detail.detach(), 0.0, 1.0)
+        density_mse = torch.mean((pred_density - target_density).square())
+        density_mse_val = float(density_mse.item())
+        ema_density_mse = density_mse_val if ema_density_mse is None else (0.98 * ema_density_mse + 0.02 * density_mse_val)
 
         if step % args.log_every == 0 or step == 1:
             print(
-                f"step={step:6d}  obj={objective_val:.8f}  data_obj={data_objective_val:.8f}  "
-                f"mse={mse_val:.8f}  l1={l1_val:.8f}  grad={grad_reg_val:.8f}  "
-                f"empty={empty_leak_val:.8f}  high_surface={high_surface_val:.8f}  "
-                f"ema_mse={ema_mse:.8f}  "
-                f"lr={lr_now:.6f}  ramp={loss_ramp:.3f}"
+                f"step={step:6d}  obj={float(objective.item()):.8f}  detail_mse={float(detail_mse.item()):.8f}  "
+                f"smooth={float(smoothness.item()):.8f}  density_mse={density_mse_val:.8f}  "
+                f"ema_density_mse={ema_density_mse:.8f}  lr={lr_now:.6f}"
             )
 
-        if step >= args.min_steps and ema_mse is not None and ema_mse <= args.target_mse:
+        if step >= args.min_steps and ema_density_mse is not None and ema_density_mse <= args.target_mse:
             stop_step = step
-            print(f"Early stop at step {step}: ema_mse={ema_mse:.8f} <= target_mse={args.target_mse:.8f}")
+            print(
+                f"Early stop at step {step}: ema_density_mse={ema_density_mse:.8f} <= target_mse={args.target_mse:.8f}"
+            )
             break
 
     with torch.no_grad():
-        eval_sets: List[Tuple[str, str, SparseSampleBank | None]] = []
+        eval_sets: List[Tuple[str, str, SparseSampleBank | None, torch.Tensor | None]] = []
         if target_source == "samples":
-            eval_sets.append(("train", "samples", train_sample_bank))
+            eval_sets.append(("train", "samples", train_sample_bank, train_inside_indices))
             if eval_sample_bank is not None:
-                eval_sets.append(("test", "samples", eval_sample_bank))
+                eval_sets.append(("test", "samples", eval_sample_bank, eval_inside_indices))
         else:
-            eval_sets.append(("eval", target_source, None))
+            eval_sets.append(("eval", target_source, None, None))
 
-        for label, eval_source, eval_bank in eval_sets:
-            points, target_residual, target_density, baseline_field = sample_batch(
+        for label, eval_source, eval_bank, eval_inside in eval_sets:
+            eval_points, eval_target_density, eval_coarse_density = sample_detail_batch(
                 batch_size=args.eval_samples,
                 device=device,
                 target_source=eval_source,
                 target_volume=target_volume,
                 target_sample_bank=eval_bank,
-                baseline_scale=args.baseline_scale,
-                importance_ratio=args.importance_ratio,
-                importance_threshold=args.importance_threshold,
+                coarse_density_grid=coarse_density_grid,
+                coarse_inside_threshold=inside_thr,
                 importance_oversample=args.importance_oversample,
                 importance_max_rounds=args.importance_max_rounds,
-                iso_shell_ratio=args.iso_shell_ratio,
-                surface_band_ratio=args.surface_band_ratio,
-                iso_value=args.iso_value,
-                iso_band=args.iso_band,
-                surface_min=args.surface_band_min,
-                surface_max=args.surface_band_max,
-                residual_representation=args.target_field,
-                levelset_decode_k=args.levelset_decode_k,
-                levelset_density_eps=args.levelset_density_eps,
+                sample_bank_inside_indices=eval_inside,
             )
-            eval_pred = model(encoder(points))
-            eval_pred_residual, _eval_low_term, eval_high_term = combine_residual_channels(
-                eval_pred,
-                low_scale=args.residual_low_scale,
-                high_scale=args.residual_high_scale,
+            eval_pred_detail = torch.tanh(model(encoder(eval_points)))
+            eval_target_detail = torch.clamp((eval_target_density - eval_coarse_density) / amp, -1.0, 1.0)
+            eval_target_detail = torch.where(
+                eval_coarse_density > inside_thr, eval_target_detail, torch.zeros_like(eval_target_detail)
             )
-            eval_pred_field = baseline_field + eval_pred_residual
-            if args.target_field == "levelset":
-                eval_pred_density = phi_to_density(
-                    eval_pred_field,
-                    iso_value=args.iso_value,
-                    decode_k=args.levelset_decode_k,
-                )
-            else:
-                eval_pred_density = torch.clamp(eval_pred_field, 0.0, 1.0)
-            eval_objective, eval_mse, eval_l1 = residual_loss_terms(
-                pred_residual=eval_pred_residual,
-                target_residual=target_residual,
-                target_density=target_density,
-                abs_weight_scale=args.loss_weight_abs_scale,
-                l1_coeff=args.loss_l1_coeff,
-                iso_value=args.iso_value,
-                iso_band=args.iso_band,
-                iso_loss_weight=args.loss_iso_weight,
-            )
-            eval_empty_leak = empty_space_leak_penalty(
-                pred_density=eval_pred_density,
-                target_density=target_density,
-                empty_density_threshold=args.empty_density_threshold,
-                coeff=args.loss_empty_space_weight,
-            )
-            eval_high_surface = high_surface_residual_loss(
-                pred_high_term=eval_high_term,
-                target_residual=target_residual,
-                target_density=target_density,
-                surface_min=args.surface_band_min,
-                surface_max=args.surface_band_max,
-                coeff=args.loss_high_surface_weight if args.residual_channels > 1 else 0.0,
-            )
+            eval_shell = torch.exp(-((eval_target_density - iso_center) / iso_width).square())
+            eval_weight = 1.0 + float(args.detail_shell_boost) * eval_shell
+            eval_detail_mse = torch.mean(eval_weight * (eval_pred_detail - eval_target_detail).square())
+            eval_pred_density = torch.clamp(eval_coarse_density + amp * eval_pred_detail, 0.0, 1.0)
+            eval_density_mse = torch.mean((eval_pred_density - eval_target_density).square())
             print(
-                f"final_{label}_obj={float(eval_objective.item()):.8f}  "
-                f"final_{label}_mse={float(eval_mse.item()):.8f}  "
-                f"final_{label}_l1={float(eval_l1.item()):.8f}  "
-                f"final_{label}_empty={float(eval_empty_leak.item()):.8f}  "
-                f"final_{label}_high_surface={float(eval_high_surface.item()):.8f}  "
+                f"final_{label}_detail_mse={float(eval_detail_mse.item()):.8f}  "
+                f"final_{label}_density_mse={float(eval_density_mse.item()):.8f}  "
                 f"(trained_steps={stop_step})"
             )
 
+    output_dir_path = Path(args.output_dir).resolve()
+    coarse_rel_bin = "detail_coarse_density.bin"
+    coarse_rel_meta = "detail_coarse_density.json"
+    save_dense_grid(
+        grid=coarse_density_grid,
+        grid_bin_path=output_dir_path / coarse_rel_bin,
+        grid_meta_path=output_dir_path / coarse_rel_meta,
+        field_name="detail_coarse_density",
+        extra_meta={
+            "representation": "density",
+            "domain": "[-1,1]^3",
+            **coarse_source_info,
+        },
+    )
+
     ground_truth_info["training_focus"] = {
-        "type": "iso_surface_shell",
-        "target_field": args.target_field,
-        "levelset_decode_k": float(args.levelset_decode_k),
-        "levelset_density_eps": float(args.levelset_density_eps),
-        "residual_channels": int(args.residual_channels),
-        "residual_low_scale": float(args.residual_low_scale),
-        "residual_high_scale": float(args.residual_high_scale),
+        "type": "detail_only_density",
+        "coarse_grid_dim": int(args.detail_grid_dim),
+        "detail_amplitude": float(args.detail_amplitude),
+        "inside_threshold": float(args.detail_inside_threshold),
+        "sampling": {"uniform_ratio": 0.5, "inside_ratio": 0.5},
+        "shell_boost": float(args.detail_shell_boost),
         "iso_value": float(args.iso_value),
         "iso_band": float(args.iso_band),
-        "iso_shell_ratio": float(args.iso_shell_ratio),
-        "surface_band_ratio": float(args.surface_band_ratio),
-        "surface_band_min": float(args.surface_band_min),
-        "surface_band_max": float(args.surface_band_max),
-        "iso_loss_weight": float(args.loss_iso_weight),
-        "loss_high_surface_weight": float(args.loss_high_surface_weight),
-        "empty_density_threshold": float(args.empty_density_threshold),
-        "empty_space_loss_weight": float(args.loss_empty_space_weight),
+        "detail_fade_start": float(args.detail_fade_start),
+        "detail_fade_end": float(args.detail_fade_end),
+        "coarse_grid": {
+            "bin": coarse_rel_bin,
+            "meta": coarse_rel_meta,
+            "dims": [int(v) for v in coarse_density_grid.shape],
+        },
     }
 
-    export_model(
+    export_detail_density_model(
         model=model,
         encoding_levels=args.fourier_levels,
         ground_truth_info=ground_truth_info,
-        baseline_scale=args.baseline_scale,
-        residual_representation=args.target_field,
-        levelset_decode_k=args.levelset_decode_k,
-        levelset_density_eps=args.levelset_density_eps,
-        levelset_iso_value=args.iso_value,
-        residual_low_scale=args.residual_low_scale,
-        residual_high_scale=args.residual_high_scale,
-        output_dir=Path(args.output_dir),
+        detail_amplitude=args.detail_amplitude,
+        fade_start=args.detail_fade_start,
+        fade_end=args.detail_fade_end,
+        coarse_bin_name=coarse_rel_bin,
+        coarse_meta_name=coarse_rel_meta,
+        coarse_dims=(
+            int(coarse_density_grid.shape[0]),
+            int(coarse_density_grid.shape[1]),
+            int(coarse_density_grid.shape[2]),
+        ),
+        output_dir=output_dir_path,
         weights_name=args.weights_name,
         meta_name=args.meta_name,
     )
+
     if args.copy_to_viz:
         copy_exports_to_viz(
-            source_dir=Path(args.output_dir),
+            source_dir=output_dir_path,
             dest_dir=Path(args.viz_mlp_dir),
             weights_name=args.weights_name,
             meta_name=args.meta_name,
+            extra_filenames=[coarse_rel_bin, coarse_rel_meta],
         )
 
 
@@ -1265,9 +905,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     repo_root = train_dir.parent
     default_viz_dir = repo_root / "viz" / "public" / "mlp"
     default_volume_bin = train_dir / "outputs" / "wdas_cloud_quarter_256.bin"
-    default_samples_bin = train_dir / "outputs" / "wdas_cloud_quarter_samples_4000000.bin"
-    p = argparse.ArgumentParser(
-        description="Train residual MLP vs box baseline (torus, dense volume, or sparse VDB samples) and export flat weights."
+    default_samples_bin = train_dir / "outputs" / "wdas_cloud_quarter_samples_250000.bin"
+
+    p = argparse.ArgumentParser(description="Train detail-only cloud density MLP and export flat weights.")
+    p.add_argument(
+        "--training-mode",
+        type=str,
+        default="detail_only_density",
+        choices=["detail_only_density"],
+        help="Only detail_only_density mode is supported.",
     )
     p.add_argument("--output-dir", type=str, default="outputs")
     p.add_argument("--weights-name", type=str, default="residual_mlp_weights.bin")
@@ -1283,116 +929,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=str(default_viz_dir),
         help="Destination folder for renderer artifacts when --copy-to-viz is set.",
     )
+
     p.add_argument("--batch-size", type=int, default=8192)
     p.add_argument("--eval-samples", type=int, default=32768)
     p.add_argument("--max-steps", type=int, default=12000)
     p.add_argument("--min-steps", type=int, default=500)
     p.add_argument("--target-mse", type=float, default=5e-5)
-    p.add_argument(
-        "--baseline-scale",
-        type=float,
-        default=1.0,
-        help="Scale factor applied to baseline field (smooth box for density mode, SDF box for levelset mode).",
-    )
-    p.add_argument(
-        "--residual-channels",
-        type=int,
-        default=2,
-        choices=[1, 2],
-        help="Number of residual output channels. 2 enables low/high decomposition.",
-    )
-    p.add_argument(
-        "--residual-low-scale",
-        type=float,
-        default=0.5,
-        help="Scale applied to low-frequency residual channel during reconstruction.",
-    )
-    p.add_argument(
-        "--residual-high-scale",
-        type=float,
-        default=0.15,
-        help="Scale applied to high-frequency residual channel during reconstruction.",
-    )
-    p.add_argument(
-        "--target-field",
-        type=str,
-        default="levelset",
-        choices=["density", "levelset"],
-        help="Residual target space: additive density residual or levelset (phi) residual.",
-    )
-    p.add_argument(
-        "--levelset-decode-k",
-        type=float,
-        default=16.0,
-        help="Sharpness used for levelset<->density mapping: density = sigmoid(logit(iso) - k*phi).",
-    )
-    p.add_argument(
-        "--levelset-density-eps",
-        type=float,
-        default=1e-3,
-        help="Clamp epsilon for stable density->levelset logit conversion.",
-    )
-    p.add_argument(
-        "--grad-reg-coeff",
-        type=float,
-        default=2e-4,
-        help="Coefficient for gradient regularization on d(pred_residual)/d(points). Set 0 to disable.",
-    )
-    p.add_argument(
-        "--loss-weight-abs-scale",
-        type=float,
-        default=2.0,
-        help="Weighted-MSE scale: weight = 1 + scale * abs(target_residual). Set 0 for unweighted MSE.",
-    )
-    p.add_argument(
-        "--loss-l1-coeff",
-        type=float,
-        default=0.2,
-        help="Additional L1 term coefficient in objective. Set 0 to disable.",
-    )
-    p.add_argument(
-        "--loss-iso-weight",
-        type=float,
-        default=3.0,
-        help="Extra weight scale for residual error near iso-density shell.",
-    )
-    p.add_argument(
-        "--loss-high-surface-weight",
-        type=float,
-        default=1.0,
-        help="Auxiliary high-channel residual loss weight applied only inside the surface band.",
-    )
-    p.add_argument(
-        "--loss-empty-space-weight",
-        type=float,
-        default=1.0,
-        help="Penalty weight for predicted density leaking into target-empty regions.",
-    )
-    p.add_argument(
-        "--empty-density-threshold",
-        type=float,
-        default=0.02,
-        help="Target density threshold below which points are considered empty for leak penalty.",
-    )
+
     p.add_argument("--lr", type=float, default=5e-4)
-    p.add_argument(
-        "--lr-final",
-        type=float,
-        default=1e-4,
-        help="Final learning rate for cosine decay schedule.",
-    )
-    p.add_argument(
-        "--lr-warmup-steps",
-        type=int,
-        default=300,
-        help="Linear LR warmup steps before cosine decay.",
-    )
-    p.add_argument(
-        "--loss-ramp-steps",
-        type=int,
-        default=3000,
-        help="Ramp-up steps for weighted/iso/empty loss scales.",
-    )
+    p.add_argument("--lr-final", type=float, default=1e-4)
+    p.add_argument("--lr-warmup-steps", type=int, default=300)
+
     p.add_argument("--fourier-levels", type=int, default=8)
     p.add_argument(
         "--hidden-layers",
@@ -1400,14 +947,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         nargs=2,
         default=[128, 128],
         metavar=("H0", "H1"),
-        help="Two hidden layer sizes for the residual MLP (default: 128 128).",
+        help="Two hidden layer sizes for the detail MLP (default: 128 128).",
     )
+
     p.add_argument(
         "--target-source",
         type=str,
         default="samples",
         choices=["torus", "volume", "samples"],
-        help="Ground-truth source. Defaults to sparse samples generated directly from the quarter-resolution Disney VDB.",
+        help="Ground-truth source. Defaults to sparse samples generated from the quarter-resolution Disney VDB.",
     )
     p.add_argument(
         "--volume-bin",
@@ -1433,73 +981,50 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional path to sparse samples metadata JSON. Defaults to <samples-bin>.json.",
     )
-    p.add_argument("--log-every", type=int, default=200)
-    p.add_argument(
-        "--importance-ratio",
-        type=float,
-        default=0.5,
-        help="Fraction of points sampled from non-empty regions for volume targets (0..1).",
-    )
-    p.add_argument(
-        "--importance-threshold",
-        type=float,
-        default=0.05,
-        help="Density threshold used to accept guided samples for volume targets.",
-    )
-    p.add_argument(
-        "--importance-oversample",
-        type=int,
-        default=4,
-        help="Candidate multiplier used during guided sample rejection sampling.",
-    )
-    p.add_argument(
-        "--importance-max-rounds",
-        type=int,
-        default=8,
-        help="Maximum rejection-sampling rounds when filling guided points.",
-    )
-    p.add_argument(
-        "--iso-shell-ratio",
-        type=float,
-        default=0.35,
-        help="Fraction of each batch sampled from iso-density shell candidates.",
-    )
-    p.add_argument(
-        "--surface-band-ratio",
-        type=float,
-        default=0.55,
-        help="Fraction of each batch sampled from surface-detail density band [surface-band-min, surface-band-max].",
-    )
-    p.add_argument(
-        "--iso-value",
-        type=float,
-        default=0.10,
-        help="Iso-density center used for boundary-focused sampling/loss.",
-    )
-    p.add_argument(
-        "--iso-band",
-        type=float,
-        default=0.05,
-        help="Half-width of iso shell for boundary-focused sampling/loss.",
-    )
-    p.add_argument(
-        "--surface-band-min",
-        type=float,
-        default=0.05,
-        help="Lower density bound for surface-band oversampling.",
-    )
-    p.add_argument(
-        "--surface-band-max",
-        type=float,
-        default=0.30,
-        help="Upper density bound for surface-band oversampling.",
-    )
     p.add_argument(
         "--val-ratio",
         type=float,
         default=0.1,
         help="Held-out test split ratio for sparse samples (0 disables split).",
     )
+
+    p.add_argument(
+        "--coarse-grid-source-bin",
+        type=str,
+        default=str(default_volume_bin),
+        help="Source dense volume used to build coarse grid when target-source=samples.",
+    )
+    p.add_argument(
+        "--coarse-grid-source-meta",
+        type=str,
+        default="",
+        help="Optional metadata for --coarse-grid-source-bin. Defaults to <bin>.json.",
+    )
+    p.add_argument("--detail-grid-dim", type=int, default=64)
+    p.add_argument("--detail-amplitude", type=float, default=0.15)
+    p.add_argument("--detail-inside-threshold", type=float, default=0.01)
+    p.add_argument("--detail-shell-boost", type=float, default=2.0)
+    p.add_argument("--detail-smoothness-coeff", type=float, default=0.0)
+    p.add_argument("--detail-fade-start", type=float, default=0.02)
+    p.add_argument("--detail-fade-end", type=float, default=0.15)
+
+    p.add_argument("--iso-value", type=float, default=0.10)
+    p.add_argument("--iso-band", type=float, default=0.05)
+
+    p.add_argument(
+        "--importance-oversample",
+        type=int,
+        default=4,
+        help="Candidate multiplier used during inside-coarse rejection sampling.",
+    )
+    p.add_argument(
+        "--importance-max-rounds",
+        type=int,
+        default=8,
+        help="Maximum rejection-sampling rounds when filling inside-coarse points.",
+    )
+
+    p.add_argument("--log-every", type=int, default=200)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="")
     return p

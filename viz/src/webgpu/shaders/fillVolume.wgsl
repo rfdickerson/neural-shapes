@@ -18,23 +18,50 @@ struct MLPMetadata {
   b2Offset: u32,
   fourierLevels: u32,
   outputDim: u32,
-  _pad0: u32,
+  _pad0: u32, // inference mode: 2=detail_only_density
 }
 
 struct FillParams {
-  baselineHalfExtents: vec4<f32>, // xyz = half extents, w = baseline scale
-  params0: vec4<f32>, // x=baseline sharpness, y=noise floor, z=soft knee width, w=representation mode
-  params1: vec4<f32>, // x=levelset decode k, y=iso logit, z=iso value, w=low residual scale
-  params2: vec4<f32>, // x=high residual scale, yzw=reserved
+  baselineHalfExtents: vec4<f32>,
+  params0: vec4<f32>,
+  params1: vec4<f32>, // z=detail fade start, w=detail fade end
+  params2: vec4<f32>, // w=detail amplitude
 }
 
 @group(0) @binding(0) var volumeOut: texture_storage_3d<rgba16float, write>;
-@group(0) @binding(1) var<storage, read> mlpWeights: array<f16>;
-@group(0) @binding(2) var<uniform> mlpMeta: MLPMetadata;
-@group(0) @binding(3) var<uniform> fillParams: FillParams;
+@group(0) @binding(1) var featureFieldTex: texture_3d<f32>;
+@group(0) @binding(2) var<storage, read> mlpWeights: array<f16>;
+@group(0) @binding(3) var<uniform> mlpMeta: MLPMetadata;
+@group(0) @binding(4) var<uniform> fillParams: FillParams;
 
-fn encodePosition(p: vec3<f32>) -> array<f32, ENCODED_DIM> {
-  var out: array<f32, ENCODED_DIM>;
+fn sampleFeatureField(p: vec3<f32>) -> f32 {
+  let dims = textureDimensions(featureFieldTex);
+  let uvw = clamp(p * 0.5 + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
+  let pTex = uvw * vec3<f32>(dims - vec3<u32>(1u));
+  let i0 = vec3<u32>(floor(pTex));
+  let i1 = min(i0 + vec3<u32>(1u), dims - vec3<u32>(1u));
+  let t = pTex - vec3<f32>(i0);
+
+  let c000 = textureLoad(featureFieldTex, vec3<i32>(i0), 0).x;
+  let c100 = textureLoad(featureFieldTex, vec3<i32>(vec3<u32>(i1.x, i0.y, i0.z)), 0).x;
+  let c010 = textureLoad(featureFieldTex, vec3<i32>(vec3<u32>(i0.x, i1.y, i0.z)), 0).x;
+  let c110 = textureLoad(featureFieldTex, vec3<i32>(vec3<u32>(i1.x, i1.y, i0.z)), 0).x;
+  let c001 = textureLoad(featureFieldTex, vec3<i32>(vec3<u32>(i0.x, i0.y, i1.z)), 0).x;
+  let c101 = textureLoad(featureFieldTex, vec3<i32>(vec3<u32>(i1.x, i0.y, i1.z)), 0).x;
+  let c011 = textureLoad(featureFieldTex, vec3<i32>(vec3<u32>(i0.x, i1.y, i1.z)), 0).x;
+  let c111 = textureLoad(featureFieldTex, vec3<i32>(i1), 0).x;
+
+  let c00 = mix(c000, c100, t.x);
+  let c10 = mix(c010, c110, t.x);
+  let c01 = mix(c001, c101, t.x);
+  let c11 = mix(c011, c111, t.x);
+  let c0 = mix(c00, c10, t.y);
+  let c1 = mix(c01, c11, t.y);
+  return mix(c0, c1, t.z);
+}
+
+fn encodeFourierInput(p: vec3<f32>) -> array<f32, ENCODED_DIM> {
+  var out = array<f32, ENCODED_DIM>();
   var idx = 0u;
 
   out[idx] = p.x;
@@ -46,9 +73,6 @@ fn encodePosition(p: vec3<f32>) -> array<f32, ENCODED_DIM> {
 
   for (var i = 0u; i < mlpMeta.fourierLevels; i++) {
     let freq = pow(2.0, f32(i));
-
-    // Must match training order exactly:
-    // [sin(freq*x), sin(freq*y), sin(freq*z), cos(freq*x), cos(freq*y), cos(freq*z)]
     out[idx] = sin(freq * p.x);
     idx++;
     out[idx] = sin(freq * p.y);
@@ -108,8 +132,8 @@ fn linearFromHidden(
   return out;
 }
 
-fn mlpResidualTerms(p: vec3<f32>) -> vec2<f32> {
-  let encoded = encodePosition(p);
+fn mlpDetail(p: vec3<f32>) -> f32 {
+  let encoded = encodeFourierInput(p);
   let h0 = linearFromEncoded(
     encoded,
     mlpMeta.inputDim,
@@ -125,55 +149,22 @@ fn mlpResidualTerms(p: vec3<f32>) -> vec2<f32> {
     mlpMeta.b1Offset
   );
 
-  let outDim = max(1u, mlpMeta.outputDim);
-  let rowStride = mlpMeta.hidden1;
-  var sum0 = f32(mlpWeights[mlpMeta.b2Offset]);
-  var sum1 = 0.0;
-  if (outDim > 1u) {
-    sum1 = f32(mlpWeights[mlpMeta.b2Offset + 1u]);
-  }
+  var sum = f32(mlpWeights[mlpMeta.b2Offset]);
   for (var i = 0u; i < mlpMeta.hidden1; i++) {
-    let w0 = f32(mlpWeights[mlpMeta.w2Offset + i]);
-    sum0 += w0 * h1[i];
-    if (outDim > 1u) {
-      let w1 = f32(mlpWeights[mlpMeta.w2Offset + rowStride + i]);
-      sum1 += w1 * h1[i];
-    }
+    let w = f32(mlpWeights[mlpMeta.w2Offset + i]);
+    sum += w * h1[i];
   }
-
-  return vec2<f32>(sum0, sum1);
-}
-
-fn sdBox(p: vec3<f32>, halfExtents: vec3<f32>) -> f32 {
-  let q = abs(p) - halfExtents;
-  let outside = length(max(q, vec3<f32>(0.0)));
-  let inside = min(max(max(q.x, q.y), q.z), 0.0);
-  return outside + inside;
-}
-
-fn smoothBoxBaseline(p: vec3<f32>) -> f32 {
-  let sdf = sdBox(p, fillParams.baselineHalfExtents.xyz);
-  return 1.0 / (1.0 + exp(fillParams.params0.x * sdf));
-}
-
-fn phiToDensity(phi: f32, decodeK: f32, isoLogit: f32) -> f32 {
-  let x = isoLogit - decodeK * phi;
-  return 1.0 / (1.0 + exp(-x));
+  return tanh(sum);
 }
 
 fn evalRawDensity(p: vec3<f32>) -> f32 {
-  let residualTerms = mlpResidualTerms(p);
-  let lowTerm = fillParams.params1.w * residualTerms.x;
-  let highTerm = fillParams.params2.x * residualTerms.y;
-  let residual = lowTerm + highTerm;
-  let mode = fillParams.params0.w;
-  if (mode > 0.5) {
-    let baselineSdf = fillParams.baselineHalfExtents.w * sdBox(p, fillParams.baselineHalfExtents.xyz);
-    let phi = baselineSdf + residual;
-    return clamp(phiToDensity(phi, fillParams.params1.x, fillParams.params1.y), 0.0, 1.0);
-  }
-  let macroDensity = fillParams.baselineHalfExtents.w * smoothBoxBaseline(p);
-  return clamp(macroDensity + residual, 0.0, 1.0);
+  let coarse = clamp(sampleFeatureField(p), 0.0, 1.0);
+  let detail = mlpDetail(p);
+  let fadeStart = clamp(fillParams.params1.z, 0.0, 1.0);
+  let fadeEnd = clamp(fillParams.params1.w, fadeStart + 1.0e-4, 1.0);
+  let detailFade = smoothstep(fadeStart, fadeEnd, coarse);
+  let detailAmp = max(fillParams.params2.w, 0.0);
+  return clamp(coarse + detailAmp * detail * detailFade, 0.0, 1.0);
 }
 
 @compute @workgroup_size(4, 4, 4)
@@ -201,10 +192,6 @@ fn csMain(@builtin(global_invocation_id) id: vec3<u32>) {
     rawDensity = (rawDensity + evalRawDensity(p0) + evalRawDensity(p1) + evalRawDensity(p2) + evalRawDensity(p3)) * 0.2;
   }
 
-  let floor = clamp(fillParams.params0.y, 0.0, 1.0);
-  let knee = max(fillParams.params0.z, 1.0e-4);
-  let gate = smoothstep(floor, floor + knee, rawDensity);
-  let density = rawDensity * gate;
-
+  let density = clamp(rawDensity, 0.0, 1.0);
   textureStore(volumeOut, vec3<i32>(id), vec4f(density, 0.0, 0.0, 0.0));
 }

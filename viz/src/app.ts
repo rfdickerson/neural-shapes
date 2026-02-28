@@ -3,7 +3,6 @@ import { WebGPURenderer, type RenderMode } from "./webgpu/renderer";
 
 const DEFAULT_SUN_PITCH = 50;
 const DEFAULT_SUN_AZIMUTH = 25;
-const DEFAULT_NOISE_FLOOR = 0.14;
 const MAX_RENDER_DPR = 1.5;
 
 export class App {
@@ -11,8 +10,6 @@ export class App {
   private readonly modeSelect: HTMLSelectElement;
   private readonly densitySlider: HTMLInputElement;
   private readonly densityValue: HTMLSpanElement;
-  private readonly noiseFloorSlider: HTMLInputElement;
-  private readonly noiseFloorValue: HTMLSpanElement;
   private readonly sunPitchSlider: HTMLInputElement;
   private readonly sunPitchValue: HTMLSpanElement;
   private readonly sunAzimuthSlider: HTMLInputElement;
@@ -74,31 +71,6 @@ export class App {
     densityRow.className = "controls__row";
     densityRow.append(densityLabel, densityField);
     cloudPanel.appendChild(densityRow);
-
-    const noiseFloorLabel = document.createElement("label");
-    noiseFloorLabel.className = "controls__label";
-    noiseFloorLabel.htmlFor = "noise-floor-slider";
-    noiseFloorLabel.textContent = "Noise Floor";
-
-    this.noiseFloorSlider = document.createElement("input");
-    this.noiseFloorSlider.id = "noise-floor-slider";
-    this.noiseFloorSlider.className = "controls__range";
-    this.noiseFloorSlider.type = "range";
-    this.noiseFloorSlider.min = "0.00";
-    this.noiseFloorSlider.max = "0.80";
-    this.noiseFloorSlider.step = "0.005";
-    this.noiseFloorSlider.value = DEFAULT_NOISE_FLOOR.toFixed(3);
-
-    this.noiseFloorValue = document.createElement("span");
-    this.noiseFloorValue.className = "controls__value";
-    this.noiseFloorValue.textContent = Number(this.noiseFloorSlider.value).toFixed(3);
-    const noiseFloorField = document.createElement("div");
-    noiseFloorField.className = "controls__field";
-    noiseFloorField.append(this.noiseFloorSlider, this.noiseFloorValue);
-    const noiseFloorRow = document.createElement("div");
-    noiseFloorRow.className = "controls__row";
-    noiseFloorRow.append(noiseFloorLabel, noiseFloorField);
-    cloudPanel.appendChild(noiseFloorRow);
 
     const sunPanel = document.createElement("section");
     sunPanel.className = "controls-panel";
@@ -179,18 +151,6 @@ export class App {
       this.needsRender = true;
     });
 
-    const applyNoiseFloor = () => {
-      const value = Number(this.noiseFloorSlider.value);
-      this.renderer?.setReconstructionNoiseFloor(value);
-      this.needsRender = true;
-    };
-    this.noiseFloorSlider.addEventListener("input", () => {
-      const value = Number(this.noiseFloorSlider.value);
-      this.noiseFloorValue.textContent = value.toFixed(3);
-    });
-    // Applying noise-floor rebuilds volume + lighting; commit on release to avoid expensive per-step updates.
-    this.noiseFloorSlider.addEventListener("change", applyNoiseFloor);
-
     this.sunPitchSlider.addEventListener("input", () => {
       const pitch = Number(this.sunPitchSlider.value);
       this.sunPitchValue.textContent = `${Math.round(pitch)}deg`;
@@ -211,7 +171,6 @@ export class App {
     this.renderer.setDensitySource("neural");
     this.renderer.setRenderMode(this.modeSelect.value as RenderMode);
     this.renderer.setCloudDensity(Number(this.densitySlider.value));
-    this.renderer.setReconstructionNoiseFloor(Number(this.noiseFloorSlider.value));
     this.renderer.setSunAngles(Number(this.sunPitchSlider.value), Number(this.sunAzimuthSlider.value));
     this.needsRender = true;
     window.addEventListener("resize", this.handleResize);

@@ -1,0 +1,59 @@
+{
+  "dims": [
+    64,
+    64,
+    64
+  ],
+  "dtype": "float32",
+  "field": "baseline_support",
+  "domain": "[-1,1]^3",
+  "representation": "support_density",
+  "grid_usage": "support_mask",
+  "iso_value": 0.1,
+  "decode_k": 32.0,
+  "density_eps": 0.001,
+  "baseline_scale": 1.0,
+  "shell_threshold": 0.18,
+  "support_threshold": 0.03,
+  "source": "explicit_source_volume",
+  "source_bin": "/home/rfdic/projects/neural-clouds/train/outputs/wdas_cloud_quarter_256.bin",
+  "source_meta": "/home/rfdic/projects/neural-clouds/train/outputs/wdas_cloud_quarter_256.json",
+  "source_dims": [
+    256,
+    256,
+    256
+  ],
+  "source_meta_json": {
+    "format": "dense_f32",
+    "dims": [
+      256,
+      256,
+      256
+    ],
+    "domain": "normalized_cube",
+    "domain_min": [
+      -1.0,
+      -1.0,
+      -1.0
+    ],
+    "domain_max": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "source": {
+      "vdb_path": "./train/wdas_cloud_quarter.vdb",
+      "grid": "density",
+      "active_world_min": [
+        -217.499995,
+        -67.4999984,
+        -298.333326
+      ],
+      "active_world_max": [
+        197.499995,
+        214.166662,
+        212.499995
+      ]
+    }
+  }
+}
